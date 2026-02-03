@@ -410,6 +410,7 @@ create_fizzy_card() {
     local labels_json="$3"
     local comments_json="$4"
     local issue_number="$5"
+    local created_at="$6"
 
     log_verbose "Creating card for issue #$issue_number: $title"
 
@@ -446,13 +447,17 @@ create_fizzy_card() {
     html_body=$(markdown_to_html "$body")
     echo "$html_body" > "$desc_file"
 
+    # Build the fizzy card create command
+    local cmd="fizzy card create $fizzy_opts --board \"$BOARD_ID\" --title \"$title\" --description_file \"$desc_file\""
+
+    # Add created-at timestamp if available
+    if [[ -n "$created_at" && "$created_at" != "null" ]]; then
+        cmd+=" --created-at \"$created_at\""
+    fi
+
     # Create the card
     local response
-    response=$(fizzy card create \
-        $fizzy_opts \
-        --board "$BOARD_ID" \
-        --title "$title" \
-        --description_file "$desc_file" 2>&1) || true
+    response=$(eval "$cmd" 2>&1) || true
 
     rm -f "$desc_file"
 
@@ -603,16 +608,17 @@ main() {
         local issue
         issue=$(echo "$issues_json" | jq ".[$i]")
 
-        local number title body labels_json comments_json
+        local number title body labels_json comments_json created_at
         number=$(echo "$issue" | jq -r '.number')
         title=$(echo "$issue" | jq -r '.title')
         body=$(echo "$issue" | jq -r '.body // ""')
         labels_json=$(echo "$issue" | jq '.labels // []')
         comments_json=$(echo "$issue" | jq '.comments // []')
+        created_at=$(echo "$issue" | jq -r '.createdAt // ""')
 
         log_info "Processing issue #$number ($((i+1))/$TOTAL_ISSUES)"
 
-        if create_fizzy_card "$title" "$body" "$labels_json" "$comments_json" "$number"; then
+        if create_fizzy_card "$title" "$body" "$labels_json" "$comments_json" "$number" "$created_at"; then
             SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
             post_migration_github "$number"
         else
