@@ -630,7 +630,11 @@ create_placeholder_card() {
         return 1
     fi
 
-    log_verbose "Created placeholder card #$target_number in Dump board"
+    # Close the placeholder card immediately
+    fizzy card close "$target_number" $fizzy_opts >/dev/null 2>&1 || \
+        log_warn "Failed to close placeholder card #$target_number"
+
+    log_verbose "Created and closed placeholder card #$target_number in Dump board"
 }
 
 # Fill gaps in card numbers by creating placeholder cards
