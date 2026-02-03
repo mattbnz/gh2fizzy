@@ -503,7 +503,7 @@ create_fizzy_card() {
         # fizzy card create doesn't return card data, fetch most recent card by title match
         log_verbose "Fetching card number for newly created card..."
         local cards_response
-        cards_response=$(fizzy card list --board "$BOARD_ID" $fizzy_opts 2>/dev/null) || true
+        cards_response=$(fizzy card list --board "$BOARD_ID" --all $fizzy_opts 2>/dev/null) || true
         card_number=$(echo "$cards_response" | jq -r --arg title "$title" '.data[] | select(.title == $title) | .number' 2>/dev/null | head -1)
     fi
 
@@ -776,7 +776,7 @@ main() {
 
         # Get cards from target board for filtering already-migrated issues
         local existing_cards
-        existing_cards=$(fizzy card list --board "$BOARD_ID" $fizzy_opts 2>/dev/null) || true
+        existing_cards=$(fizzy card list --board "$BOARD_ID" --all $fizzy_opts 2>/dev/null) || true
         local existing_numbers
         existing_numbers=$(echo "$existing_cards" | jq -r '.data[].number // empty' 2>/dev/null | sort -n | tr '\n' ' ')
 
@@ -789,7 +789,7 @@ main() {
 
         for board_id in $board_ids; do
             local board_cards
-            board_cards=$(fizzy card list --board "$board_id" $fizzy_opts 2>/dev/null) || true
+            board_cards=$(fizzy card list --board "$board_id" --all $fizzy_opts 2>/dev/null) || true
             local board_max
             board_max=$(echo "$board_cards" | jq '[.data[].number // 0] | max // 0' 2>/dev/null) || board_max=0
             if [[ "$board_max" -gt "$current_max_card" ]]; then
