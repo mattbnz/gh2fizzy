@@ -593,7 +593,7 @@ create_fizzy_card() {
         # fizzy card create doesn't return card data, fetch most recent card by title match
         log_verbose "Fetching card number for newly created card..."
         local cards_response
-        cards_response=$(fizzy card list --board "$BOARD_ID" --all --indexed-by all $fizzy_opts 2>/dev/null) || true
+        cards_response=$(fizzy card list --board "$BOARD_ID" --all --sort newest $fizzy_opts 2>/dev/null) || true
         card_number=$(echo "$cards_response" | jq -r --arg title "$title" '.data[] | select(.title == $title) | .number' 2>/dev/null | head -1)
     fi
 
@@ -908,40 +908,49 @@ main() {
         local fizzy_opts=""
         [[ -n "$FIZZY_ACCOUNT_ID" ]] && fizzy_opts+=" --account $FIZZY_ACCOUNT_ID"
 
-        # Get cards from target board for filtering already-migrated issues
-        local existing_cards
-        existing_cards=$(fizzy card list --board "$BOARD_ID" --all --indexed-by all $fizzy_opts 2>/dev/null) || true
-        local existing_numbers
-        existing_numbers=$(echo "$existing_cards" | jq -r '.data[].number // empty' 2>/dev/null | sort -n | tr '\n' ' ')
-
-        # Find max card number across ALL boards (card numbers are account-wide)
-        log_info "Finding highest card number in account..."
+        # Find all card numbers across ALL boards (card numbers are account-wide)
+        # Need to fetch both open and closed cards separately
+        log_info "Finding all card numbers in account..."
         local all_boards
         all_boards=$(fizzy board list $fizzy_opts 2>/dev/null) || true
         local board_ids
         board_ids=$(echo "$all_boards" | jq -r '.data[].id // empty' 2>/dev/null)
 
+        local all_card_numbers="[]"
         for board_id in $board_ids; do
-            local board_cards
-            board_cards=$(fizzy card list --board "$board_id" --all --indexed-by all $fizzy_opts 2>/dev/null) || true
+            # Fetch open cards
+            local open_cards
+            open_cards=$(fizzy card list --board "$board_id" --all --sort newest $fizzy_opts 2>/dev/null) || true
+            local open_nums
+            open_nums=$(echo "$open_cards" | jq '[.data[].number // empty]' 2>/dev/null) || open_nums="[]"
+
+            # Fetch closed cards
+            local closed_cards
+            closed_cards=$(fizzy card list --board "$board_id" --all --indexed-by closed --sort newest $fizzy_opts 2>/dev/null) || true
+            local closed_nums
+            closed_nums=$(echo "$closed_cards" | jq '[.data[].number // empty]' 2>/dev/null) || closed_nums="[]"
+
+            # Combine with all card numbers
+            all_card_numbers=$(echo "$all_card_numbers" | jq --argjson open "$open_nums" --argjson closed "$closed_nums" '. + $open + $closed | unique')
+
+            # Track max for this board
             local board_max
-            board_max=$(echo "$board_cards" | jq '[.data[].number // 0] | max // 0' 2>/dev/null) || board_max=0
+            board_max=$(echo "$all_card_numbers" | jq 'max // 0' 2>/dev/null) || board_max=0
             if [[ "$board_max" -gt "$current_max_card" ]]; then
                 current_max_card="$board_max"
             fi
         done
         log_verbose "Current max card number in account: $current_max_card"
 
+        local existing_numbers
+        existing_numbers=$(echo "$all_card_numbers" | jq -r '.[]' 2>/dev/null | sort -n | tr '\n' ' ')
+
         if [[ -n "$existing_numbers" ]]; then
-            log_verbose "Existing card numbers in target board: $existing_numbers"
+            log_verbose "Existing card numbers in account: $existing_numbers"
 
-            # Get existing card numbers as JSON array for efficient filtering
-            local existing_numbers_json
-            existing_numbers_json=$(echo "$existing_cards" | jq '[.data[].number]')
-
-            # Filter out issues in one jq call
+            # Filter out issues whose numbers already exist as cards anywhere
             local total_before=$TOTAL_ISSUES
-            issues_json=$(echo "$issues_json" | jq --argjson existing "$existing_numbers_json" \
+            issues_json=$(echo "$issues_json" | jq --argjson existing "$all_card_numbers" \
                 '[.[] | select(.number as $n | $existing | index($n) | not)]')
             TOTAL_ISSUES=$(echo "$issues_json" | jq 'length')
 
