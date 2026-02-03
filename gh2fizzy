@@ -273,7 +273,7 @@ check_auth() {
     fi
 
     # Check Fizzy auth
-    if ! fizzy identity show --quiet &>/dev/null; then
+    if ! fizzy identity show &>/dev/null; then
         die "Fizzy CLI not authenticated. Run: fizzy auth login YOUR_TOKEN" 4
     fi
 
@@ -458,8 +458,7 @@ create_fizzy_card() {
         $fizzy_opts \
         --board "$BOARD_ID" \
         --title "$title" \
-        --description_file "$desc_file" \
-        --format json 2>&1) || true
+        --description_file "$desc_file" 2>&1) || true
 
     rm -f "$desc_file"
 
@@ -481,7 +480,7 @@ create_fizzy_card() {
         # fizzy card create doesn't return card data, fetch most recent card by title match
         log_verbose "Fetching card number for newly created card..."
         local cards_response
-        cards_response=$(fizzy card list --board "$BOARD_ID" $fizzy_opts --format json 2>/dev/null) || true
+        cards_response=$(fizzy card list --board "$BOARD_ID" $fizzy_opts 2>/dev/null) || true
         card_number=$(echo "$cards_response" | jq -r --arg title "$title" '.data[] | select(.title == $title) | .number' 2>/dev/null | head -1)
     fi
 
@@ -496,7 +495,7 @@ create_fizzy_card() {
     # Move to column if specified
     if [[ -n "$COLUMN_ID" ]]; then
         log_verbose "Moving card #$card_number to column $COLUMN_ID"
-        fizzy card column "$card_number" --column "$COLUMN_ID" $fizzy_opts --quiet >/dev/null 2>&1 || \
+        fizzy card column "$card_number" --column "$COLUMN_ID" $fizzy_opts >/dev/null 2>&1 || \
             log_warn "Failed to move card to column"
     fi
 
@@ -509,7 +508,7 @@ create_fizzy_card() {
         while [[ $j -lt $label_count ]]; do
             local label_name
             label_name=$(echo "$labels_json" | jq -r ".[$j].name")
-            fizzy card tag "$card_number" --tag "$label_name" $fizzy_opts --quiet >/dev/null 2>&1 || \
+            fizzy card tag "$card_number" --tag "$label_name" $fizzy_opts >/dev/null 2>&1 || \
                 log_warn "Failed to apply tag: $label_name"
             j=$((j + 1))
         done
