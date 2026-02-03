@@ -466,10 +466,30 @@ create_fizzy_card() {
         return 0
     fi
 
+    # Construct GitHub issue URL for footer
+    local repo_slug="$REPO"
+    if [[ -z "$repo_slug" ]]; then
+        repo_slug=$(gh repo view --json nameWithOwner -q '.nameWithOwner' 2>/dev/null) || repo_slug=""
+    fi
+    local github_url=""
+    if [[ -n "$repo_slug" ]]; then
+        github_url="https://github.com/${repo_slug}/issues/${issue_number}"
+    fi
+
+    # Append footer with GitHub link to description
+    local body_with_footer="$body"
+    if [[ -n "$github_url" ]]; then
+        body_with_footer="${body}
+
+---
+
+<small><em>Imported from <a href=\"${github_url}\">${github_url}</a></em></small>"
+    fi
+
     # Convert markdown to HTML and create temp file for description
     local desc_file html_body
     desc_file=$(mktemp)
-    html_body=$(markdown_to_html "$body")
+    html_body=$(markdown_to_html "$body_with_footer")
     echo "$html_body" > "$desc_file"
 
     # Build the fizzy card create command
