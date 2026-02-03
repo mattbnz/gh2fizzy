@@ -396,15 +396,84 @@ fetch_issues() {
     echo "$issues_json"
 }
 
+fetch_timeline_events() {
+    local repo_slug="$1"
+    local issue_number="$2"
+
+    if [[ -z "$repo_slug" ]]; then
+        echo "[]"
+        return
+    fi
+
+    # Fetch timeline events from GitHub API
+    local timeline
+    timeline=$(gh api "repos/${repo_slug}/issues/${issue_number}/timeline" --paginate 2>/dev/null) || true
+
+    if [[ -z "$timeline" ]]; then
+        echo "[]"
+        return
+    fi
+
+    # Filter and format interesting events
+    echo "$timeline" | jq '[.[] | select(.event == "closed" or .event == "referenced" or .event == "cross-referenced" or .event == "merged" or .event == "connected" or .event == "reopened") | {
+        event: .event,
+        actor: .actor.login,
+        created_at: .created_at,
+        commit_id: .commit_id,
+        commit_url: .commit_url
+    }]'
+}
+
+format_timeline_comment() {
+    local event="$1"
+    local actor="$2"
+    local created_at="$3"
+    local commit_id="$4"
+    local commit_url="$5"
+
+    local body=""
+    case "$event" in
+        closed)
+            if [[ -n "$commit_id" && "$commit_id" != "null" ]]; then
+                body="**@${actor}** closed this issue via commit [\`${commit_id:0:7}\`](${commit_url})"
+            else
+                body="**@${actor}** closed this issue"
+            fi
+            ;;
+        reopened)
+            body="**@${actor}** reopened this issue"
+            ;;
+        referenced)
+            if [[ -n "$commit_id" && "$commit_id" != "null" ]]; then
+                body="**@${actor}** referenced this issue in commit [\`${commit_id:0:7}\`](${commit_url})"
+            fi
+            ;;
+        merged)
+            body="**@${actor}** merged a pull request that closes this issue"
+            ;;
+        connected|cross-referenced)
+            body="**@${actor}** linked this issue"
+            ;;
+    esac
+
+    echo "$body"
+}
+
 create_fizzy_comment() {
     local card_number="$1"
     local author="$2"
     local body="$3"
     local created_at="$4"
     local fizzy_opts="$5"
+    local raw="${6:-false}"  # If true, don't add author prefix
 
-    # Format the comment body with author attribution
-    local formatted_body="*Migrated from GitHub - originally by @${author}*\n\n${body}"
+    # Format the comment body with author attribution (unless raw mode)
+    local formatted_body
+    if [[ "$raw" == "true" ]]; then
+        formatted_body="$body"
+    else
+        formatted_body="*Migrated from GitHub - originally by @${author}*\n\n${body}"
+    fi
 
     # Convert markdown to HTML
     local comment_file html_body
@@ -591,6 +660,43 @@ create_fizzy_card() {
         done
         if [[ $comment_fail -gt 0 ]]; then
             log_warn "Failed to add $comment_fail of $comment_count comment(s)"
+        fi
+    fi
+
+    # Fetch and add timeline events as comments
+    local repo_slug="$REPO"
+    if [[ -z "$repo_slug" ]]; then
+        repo_slug=$(gh repo view --json nameWithOwner -q '.nameWithOwner' 2>/dev/null) || repo_slug=""
+    fi
+
+    if [[ -n "$repo_slug" ]]; then
+        log_verbose "Fetching timeline events for issue #$issue_number..."
+        local timeline_events
+        timeline_events=$(fetch_timeline_events "$repo_slug" "$issue_number")
+
+        local timeline_count
+        timeline_count=$(echo "$timeline_events" | jq 'length')
+
+        if [[ "$timeline_count" -gt 0 ]]; then
+            log_verbose "Adding $timeline_count timeline event(s) as comments"
+            local t=0
+            while [[ $t -lt $timeline_count ]]; do
+                local event actor event_time commit_id commit_url
+                event=$(echo "$timeline_events" | jq -r ".[$t].event")
+                actor=$(echo "$timeline_events" | jq -r ".[$t].actor // \"unknown\"")
+                event_time=$(echo "$timeline_events" | jq -r ".[$t].created_at // \"\"")
+                commit_id=$(echo "$timeline_events" | jq -r ".[$t].commit_id // \"\"")
+                commit_url=$(echo "$timeline_events" | jq -r ".[$t].commit_url // \"\"")
+
+                local event_body
+                event_body=$(format_timeline_comment "$event" "$actor" "$event_time" "$commit_id" "$commit_url")
+
+                if [[ -n "$event_body" ]]; then
+                    create_fizzy_comment "$card_number" "" "$event_body" "$event_time" "$fizzy_opts" "true" || \
+                        log_warn "Failed to add timeline event comment"
+                fi
+                t=$((t + 1))
+            done
         fi
     fi
 
