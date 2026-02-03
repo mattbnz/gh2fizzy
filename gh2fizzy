@@ -607,9 +607,20 @@ main() {
     log_info "Starting GitHub to Fizzy migration"
     [[ "$DRY_RUN" == "true" ]] && log_warn "DRY RUN MODE - no changes will be made"
 
+    # Store original limit for later use in preserve-numbers mode
+    local original_limit="$LIMIT"
+
+    # When preserve-numbers is enabled, fetch all issues first, then apply limit after filtering
+    if [[ "$PRESERVE_NUMBERS" == "true" ]]; then
+        LIMIT=10000  # Fetch all issues
+    fi
+
     # Fetch issues
     local issues_json
     issues_json=$(fetch_issues)
+
+    # Restore original limit
+    LIMIT="$original_limit"
 
     TOTAL_ISSUES=$(echo "$issues_json" | jq 'length')
 
@@ -618,13 +629,66 @@ main() {
         exit 0
     fi
 
-    log_info "Found $TOTAL_ISSUES issue(s) to migrate"
+    log_info "Found $TOTAL_ISSUES issue(s) from GitHub"
 
-    # Sort issues by number if preserve-numbers mode is enabled
+    # Sort and filter issues if preserve-numbers mode is enabled
     if [[ "$PRESERVE_NUMBERS" == "true" ]]; then
         log_info "Sorting issues by number for preserve-numbers mode..."
         issues_json=$(echo "$issues_json" | jq 'sort_by(.number)')
+
+        # Fetch existing card numbers from Fizzy to skip already-migrated issues
+        log_info "Fetching existing cards from Fizzy..."
+        local fizzy_opts=""
+        [[ -n "$FIZZY_ACCOUNT_ID" ]] && fizzy_opts+=" --account $FIZZY_ACCOUNT_ID"
+
+        local existing_cards
+        existing_cards=$(fizzy card list --board "$BOARD_ID" $fizzy_opts 2>/dev/null) || true
+        local existing_numbers
+        existing_numbers=$(echo "$existing_cards" | jq -r '.data[].number // empty' 2>/dev/null | sort -n | tr '\n' ' ')
+
+        if [[ -n "$existing_numbers" ]]; then
+            log_verbose "Existing card numbers: $existing_numbers"
+
+            # Filter out issues that already have corresponding cards
+            local filtered_json="[]"
+            local total_before=$TOTAL_ISSUES
+            local skipped=0
+
+            for ((idx=0; idx<TOTAL_ISSUES; idx++)); do
+                local issue_num
+                issue_num=$(echo "$issues_json" | jq -r ".[$idx].number")
+
+                # Check if this issue number exists as a card
+                if echo "$existing_cards" | jq -e --arg num "$issue_num" '.data[] | select(.number == ($num | tonumber))' >/dev/null 2>&1; then
+                    log_verbose "Skipping issue #$issue_num - card already exists"
+                    skipped=$((skipped + 1))
+                else
+                    filtered_json=$(echo "$filtered_json" | jq --argjson issue "$(echo "$issues_json" | jq ".[$idx]")" '. + [$issue]')
+                fi
+            done
+
+            issues_json="$filtered_json"
+            TOTAL_ISSUES=$(echo "$issues_json" | jq 'length')
+
+            if [[ $skipped -gt 0 ]]; then
+                log_info "Skipped $skipped already-migrated issue(s), $TOTAL_ISSUES remaining"
+            fi
+        fi
+
+        # Apply limit after filtering
+        if [[ "$TOTAL_ISSUES" -gt "$LIMIT" ]]; then
+            log_info "Limiting to $LIMIT issue(s) as requested"
+            issues_json=$(echo "$issues_json" | jq ".[:$LIMIT]")
+            TOTAL_ISSUES="$LIMIT"
+        fi
     fi
+
+    if [[ "$TOTAL_ISSUES" == "0" ]]; then
+        log_info "No issues to migrate (all already migrated or none found)"
+        exit 0
+    fi
+
+    log_info "Will migrate $TOTAL_ISSUES issue(s)"
 
     # Process each issue
     local i=0
