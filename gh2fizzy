@@ -15,6 +15,7 @@ VERSION="1.0.0"
 # Default values
 REPO=""
 STATE="open"
+STATE_SET=false  # Track if user explicitly set --state
 LABELS=()
 ASSIGNEE=""
 MILESTONE=""
@@ -150,6 +151,7 @@ parse_args() {
                 ;;
             --state)
                 STATE="$2"
+                STATE_SET=true
                 shift 2
                 ;;
             -l|--label)
@@ -218,6 +220,12 @@ parse_args() {
 validate_args() {
     if [[ -z "$BOARD_ID" ]]; then
         die "Missing required argument: --board BOARD_ID\nRun 'gh2fizzy --help' for usage." 2
+    fi
+
+    # Default to 'all' state when preserve-numbers is enabled (unless explicitly set)
+    if [[ "$PRESERVE_NUMBERS" == "true" && "$STATE_SET" == "false" ]]; then
+        STATE="all"
+        log_verbose "Defaulting --state to 'all' for preserve-numbers mode"
     fi
 
     # Validate state
