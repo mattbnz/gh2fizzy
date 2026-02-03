@@ -684,27 +684,17 @@ main() {
         if [[ -n "$existing_numbers" ]]; then
             log_verbose "Existing card numbers: $existing_numbers"
 
-            # Filter out issues that already have corresponding cards
-            local filtered_json="[]"
+            # Get existing card numbers as JSON array for efficient filtering
+            local existing_numbers_json
+            existing_numbers_json=$(echo "$existing_cards" | jq '[.data[].number]')
+
+            # Filter out issues in one jq call
             local total_before=$TOTAL_ISSUES
-            local skipped=0
-
-            for ((idx=0; idx<TOTAL_ISSUES; idx++)); do
-                local issue_num
-                issue_num=$(echo "$issues_json" | jq -r ".[$idx].number")
-
-                # Check if this issue number exists as a card
-                if echo "$existing_cards" | jq -e --arg num "$issue_num" '.data[] | select(.number == ($num | tonumber))' >/dev/null 2>&1; then
-                    log_verbose "Skipping issue #$issue_num - card already exists"
-                    skipped=$((skipped + 1))
-                else
-                    filtered_json=$(echo "$filtered_json" | jq --argjson issue "$(echo "$issues_json" | jq ".[$idx]")" '. + [$issue]')
-                fi
-            done
-
-            issues_json="$filtered_json"
+            issues_json=$(echo "$issues_json" | jq --argjson existing "$existing_numbers_json" \
+                '[.[] | select(.number as $n | $existing | index($n) | not)]')
             TOTAL_ISSUES=$(echo "$issues_json" | jq 'length')
 
+            local skipped=$((total_before - TOTAL_ISSUES))
             if [[ $skipped -gt 0 ]]; then
                 log_info "Skipped $skipped already-migrated issue(s), $TOTAL_ISSUES remaining"
             fi
