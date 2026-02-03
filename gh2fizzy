@@ -419,8 +419,7 @@ fetch_timeline_events() {
         event: .event,
         actor: .actor.login,
         created_at: .created_at,
-        commit_id: .commit_id,
-        commit_url: .commit_url
+        commit_id: .commit_id
     }]'
 }
 
@@ -429,12 +428,18 @@ format_timeline_comment() {
     local actor="$2"
     local created_at="$3"
     local commit_id="$4"
-    local commit_url="$5"
+    local repo_slug="$5"
+
+    # Construct proper GitHub web URL for commits (not the API URL)
+    local commit_url=""
+    if [[ -n "$commit_id" && "$commit_id" != "null" && -n "$repo_slug" ]]; then
+        commit_url="https://github.com/${repo_slug}/commit/${commit_id}"
+    fi
 
     local body=""
     case "$event" in
         closed)
-            if [[ -n "$commit_id" && "$commit_id" != "null" ]]; then
+            if [[ -n "$commit_url" ]]; then
                 body="**@${actor}** closed this issue via commit [\`${commit_id:0:7}\`](${commit_url})"
             else
                 body="**@${actor}** closed this issue"
@@ -444,7 +449,7 @@ format_timeline_comment() {
             body="**@${actor}** reopened this issue"
             ;;
         referenced)
-            if [[ -n "$commit_id" && "$commit_id" != "null" ]]; then
+            if [[ -n "$commit_url" ]]; then
                 body="**@${actor}** referenced this issue in commit [\`${commit_id:0:7}\`](${commit_url})"
             fi
             ;;
@@ -686,10 +691,9 @@ create_fizzy_card() {
                 actor=$(echo "$timeline_events" | jq -r ".[$t].actor // \"unknown\"")
                 event_time=$(echo "$timeline_events" | jq -r ".[$t].created_at // \"\"")
                 commit_id=$(echo "$timeline_events" | jq -r ".[$t].commit_id // \"\"")
-                commit_url=$(echo "$timeline_events" | jq -r ".[$t].commit_url // \"\"")
 
                 local event_body
-                event_body=$(format_timeline_comment "$event" "$actor" "$event_time" "$commit_id" "$commit_url")
+                event_body=$(format_timeline_comment "$event" "$actor" "$event_time" "$commit_id" "$repo_slug")
 
                 if [[ -n "$event_body" ]]; then
                     create_fizzy_comment "$card_number" "" "$event_body" "$event_time" "$fizzy_opts" "true" || \
