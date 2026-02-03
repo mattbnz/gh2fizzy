@@ -34,6 +34,7 @@ ADD_MIGRATED_LABEL=false
 PRESERVE_NUMBERS=false
 ISSUES_FILE=""  # Cache file for GitHub issues JSON
 DUMP_BOARD_ID=""  # Board ID for placeholder cards (auto-created if needed)
+FIZZY_BASE_URL=""  # Base URL for Fizzy instance (extracted from identity)
 
 # Counters for summary
 TOTAL_ISSUES=0
@@ -295,9 +296,21 @@ check_auth() {
         die "GitHub CLI not authenticated. Run: gh auth login" 4
     fi
 
-    # Check Fizzy auth
-    if ! fizzy identity show &>/dev/null; then
+    # Check Fizzy auth and extract base URL
+    local identity_response
+    identity_response=$(fizzy identity show 2>/dev/null) || true
+
+    if ! echo "$identity_response" | jq -e '.success == true' &>/dev/null; then
         die "Fizzy CLI not authenticated. Run: fizzy auth login YOUR_TOKEN" 4
+    fi
+
+    # Extract base URL from user URL in identity response
+    local user_url
+    user_url=$(echo "$identity_response" | jq -r '.data.accounts[0].user.url // empty' 2>/dev/null)
+    if [[ -n "$user_url" ]]; then
+        # Extract base URL by removing the /users/... path
+        FIZZY_BASE_URL=$(echo "$user_url" | sed 's|/users/.*||')
+        log_verbose "Fizzy base URL: $FIZZY_BASE_URL"
     fi
 
     log_verbose "Authentication verified"
@@ -445,8 +458,8 @@ format_timeline_comment() {
 
     # Construct Fizzy card URL for cross-references
     local source_url=""
-    if [[ -n "$source_number" && "$source_number" != "null" && -n "$board_id" ]]; then
-        source_url="https://fizzy.app/${board_id}/${source_number}"
+    if [[ -n "$source_number" && "$source_number" != "null" && -n "$board_id" && -n "$FIZZY_BASE_URL" ]]; then
+        source_url="${FIZZY_BASE_URL}/${board_id}/${source_number}"
     fi
 
     local body=""
