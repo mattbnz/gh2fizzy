@@ -373,41 +373,35 @@ fetch_issues() {
     echo "$issues_json"
 }
 
-format_comments() {
-    local comments_json="$1"
-    local comment_count
-    comment_count=$(echo "$comments_json" | jq 'length')
+create_fizzy_comment() {
+    local card_number="$1"
+    local author="$2"
+    local body="$3"
+    local created_at="$4"
+    local fizzy_opts="$5"
 
-    if [[ "$comment_count" == "0" ]]; then
-        echo ""
-        return
+    # Format the comment body with author attribution
+    local formatted_body="*Migrated from GitHub - originally by @${author}*\n\n${body}"
+
+    # Convert markdown to HTML
+    local comment_file html_body
+    comment_file=$(mktemp)
+    html_body=$(markdown_to_html "$(echo -e "$formatted_body")")
+    echo "$html_body" > "$comment_file"
+
+    # Build the fizzy comment create command
+    local cmd="fizzy comment create --card \"$card_number\" --body_file \"$comment_file\" $fizzy_opts"
+
+    # Add created-at timestamp if available
+    if [[ -n "$created_at" && "$created_at" != "null" ]]; then
+        cmd+=" --created-at \"$created_at\""
     fi
 
-    local formatted="**Migrated Comments from GitHub Issues**\n\n"
+    eval "$cmd" >/dev/null 2>&1
+    local result=$?
 
-    # Process each comment
-    local i=0
-    while [[ $i -lt $comment_count ]]; do
-        local author body created_at
-        author=$(echo "$comments_json" | jq -r ".[$i].author.login // \"unknown\"")
-        body=$(echo "$comments_json" | jq -r ".[$i].body // \"\"")
-        created_at=$(echo "$comments_json" | jq -r ".[$i].createdAt // \"\"")
-
-        # Format the date nicely
-        local formatted_date="$created_at"
-        if [[ -n "$created_at" ]]; then
-            # Convert ISO date to readable format
-            formatted_date=$(date -d "$created_at" "+%Y-%m-%d %H:%M" 2>/dev/null || echo "$created_at")
-        fi
-
-        formatted+="---\n"
-        formatted+="**@${author}** commented on ${formatted_date}:\n\n"
-        formatted+="${body}\n\n"
-
-        i=$((i + 1))
-    done
-
-    echo -e "$formatted"
+    rm -f "$comment_file"
+    return $result
 }
 
 create_fizzy_card() {
@@ -440,7 +434,7 @@ create_fizzy_card() {
         local comment_count
         comment_count=$(echo "$comments_json" | jq 'length')
         if [[ "$comment_count" -gt 0 ]]; then
-            log_verbose "[DRY-RUN] Would add $comment_count migrated comment(s)"
+            log_verbose "[DRY-RUN] Would add $comment_count individual comment(s)"
         fi
 
         return 0
@@ -514,25 +508,30 @@ create_fizzy_card() {
         done
     fi
 
-    # Add migrated comments
-    local formatted_comments
-    formatted_comments=$(format_comments "$comments_json")
-    if [[ -n "$formatted_comments" ]]; then
-        log_verbose "Adding migrated comments to card #$card_number"
+    # Add migrated comments as individual comments
+    local comment_count
+    comment_count=$(echo "$comments_json" | jq 'length')
+    if [[ "$comment_count" -gt 0 ]]; then
+        log_verbose "Adding $comment_count comment(s) to card #$card_number"
+        local k=0
+        local comment_success=0
+        local comment_fail=0
+        while [[ $k -lt $comment_count ]]; do
+            local author body created_at
+            author=$(echo "$comments_json" | jq -r ".[$k].author.login // \"unknown\"")
+            body=$(echo "$comments_json" | jq -r ".[$k].body // \"\"")
+            created_at=$(echo "$comments_json" | jq -r ".[$k].createdAt // \"\"")
 
-        # Convert comments markdown to HTML
-        local comment_file html_comments
-        comment_file=$(mktemp)
-        html_comments=$(markdown_to_html "$formatted_comments")
-        echo "$html_comments" > "$comment_file"
-
-        fizzy comment create \
-            --card "$card_number" \
-            --body_file "$comment_file" \
-            $fizzy_opts --quiet >/dev/null 2>&1 || \
-            log_warn "Failed to add comments to card"
-
-        rm -f "$comment_file"
+            if create_fizzy_comment "$card_number" "$author" "$body" "$created_at" "$fizzy_opts"; then
+                comment_success=$((comment_success + 1))
+            else
+                comment_fail=$((comment_fail + 1))
+            fi
+            k=$((k + 1))
+        done
+        if [[ $comment_fail -gt 0 ]]; then
+            log_warn "Failed to add $comment_fail of $comment_count comment(s)"
+        fi
     fi
 }
 
