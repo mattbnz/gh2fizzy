@@ -419,7 +419,10 @@ fetch_timeline_events() {
         event: .event,
         actor: .actor.login,
         created_at: .created_at,
-        commit_id: .commit_id
+        commit_id: .commit_id,
+        source_type: .source.type,
+        source_number: (.source.issue.number // .source.pull_request.number),
+        source_title: (.source.issue.title // .source.pull_request.title)
     }]'
 }
 
@@ -429,11 +432,21 @@ format_timeline_comment() {
     local created_at="$3"
     local commit_id="$4"
     local repo_slug="$5"
+    local source_type="$6"
+    local source_number="$7"
+    local source_title="$8"
+    local board_id="$9"
 
     # Construct proper GitHub web URL for commits (not the API URL)
     local commit_url=""
     if [[ -n "$commit_id" && "$commit_id" != "null" && -n "$repo_slug" ]]; then
         commit_url="https://github.com/${repo_slug}/commit/${commit_id}"
+    fi
+
+    # Construct Fizzy card URL for cross-references
+    local source_url=""
+    if [[ -n "$source_number" && "$source_number" != "null" && -n "$board_id" ]]; then
+        source_url="https://fizzy.app/${board_id}/${source_number}"
     fi
 
     local body=""
@@ -457,7 +470,19 @@ format_timeline_comment() {
             body="**@${actor}** merged a pull request that closes this issue"
             ;;
         connected|cross-referenced)
-            body="**@${actor}** linked this issue"
+            if [[ -n "$source_number" && "$source_number" != "null" ]]; then
+                local source_label="#${source_number}"
+                if [[ -n "$source_title" && "$source_title" != "null" ]]; then
+                    source_label="#${source_number}: ${source_title}"
+                fi
+                if [[ -n "$source_url" ]]; then
+                    body="**@${actor}** mentioned this issue in [${source_label}](${source_url})"
+                else
+                    body="**@${actor}** mentioned this issue in ${source_label}"
+                fi
+            else
+                body="**@${actor}** linked this issue"
+            fi
             ;;
     esac
 
@@ -686,14 +711,17 @@ create_fizzy_card() {
             log_verbose "Adding $timeline_count timeline event(s) as comments"
             local t=0
             while [[ $t -lt $timeline_count ]]; do
-                local event actor event_time commit_id commit_url
+                local event actor event_time commit_id source_type source_number source_title
                 event=$(echo "$timeline_events" | jq -r ".[$t].event")
                 actor=$(echo "$timeline_events" | jq -r ".[$t].actor // \"unknown\"")
                 event_time=$(echo "$timeline_events" | jq -r ".[$t].created_at // \"\"")
                 commit_id=$(echo "$timeline_events" | jq -r ".[$t].commit_id // \"\"")
+                source_type=$(echo "$timeline_events" | jq -r ".[$t].source_type // \"\"")
+                source_number=$(echo "$timeline_events" | jq -r ".[$t].source_number // \"\"")
+                source_title=$(echo "$timeline_events" | jq -r ".[$t].source_title // \"\"")
 
                 local event_body
-                event_body=$(format_timeline_comment "$event" "$actor" "$event_time" "$commit_id" "$repo_slug")
+                event_body=$(format_timeline_comment "$event" "$actor" "$event_time" "$commit_id" "$repo_slug" "$source_type" "$source_number" "$source_title" "$BOARD_ID")
 
                 if [[ -n "$event_body" ]]; then
                     create_fizzy_comment "$card_number" "" "$event_body" "$event_time" "$fizzy_opts" "true" || \
