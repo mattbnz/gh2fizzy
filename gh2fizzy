@@ -352,7 +352,7 @@ build_gh_command() {
     cmd+=" --limit $LIMIT"
 
     # JSON output with all needed fields
-    cmd+=" --json number,title,body,comments,author,createdAt,labels"
+    cmd+=" --json number,title,body,comments,author,createdAt,labels,state"
 
     echo "$cmd"
 }
@@ -372,7 +372,7 @@ fetch_issues() {
             [[ -n "$REPO" ]] && repo_flag="--repo $REPO"
 
             local issue_data
-            issue_data=$(gh issue view "$issue_num" $repo_flag --json number,title,body,comments,author,createdAt,labels 2>/dev/null) || true
+            issue_data=$(gh issue view "$issue_num" $repo_flag --json number,title,body,comments,author,createdAt,labels,state 2>/dev/null) || true
 
             if [[ -n "$issue_data" ]]; then
                 [[ "$first" == "false" ]] && issues_json+=","
@@ -435,6 +435,7 @@ create_fizzy_card() {
     local issue_number="$5"
     local created_at="$6"
     local expected_number="${7:-}"  # Optional: if set, verify card number matches
+    local issue_state="${8:-open}"  # GitHub issue state: open or closed
 
     log_verbose "Creating card for issue #$issue_number: $title"
 
@@ -571,6 +572,13 @@ create_fizzy_card() {
         if [[ $comment_fail -gt 0 ]]; then
             log_warn "Failed to add $comment_fail of $comment_count comment(s)"
         fi
+    fi
+
+    # Close the card if the GitHub issue was closed
+    if [[ "$issue_state" == "closed" || "$issue_state" == "CLOSED" ]]; then
+        log_verbose "Closing card #$card_number (GitHub issue was closed)"
+        fizzy card close "$card_number" $fizzy_opts >/dev/null 2>&1 || \
+            log_warn "Failed to close card #$card_number"
     fi
 }
 
@@ -838,15 +846,16 @@ main() {
         local issue
         issue=$(echo "$issues_json" | jq ".[$i]")
 
-        local number title body labels_json comments_json created_at
+        local number title body labels_json comments_json created_at issue_state
         number=$(echo "$issue" | jq -r '.number')
         title=$(echo "$issue" | jq -r '.title')
         body=$(echo "$issue" | jq -r '.body // ""')
         labels_json=$(echo "$issue" | jq '.labels // []')
         comments_json=$(echo "$issue" | jq '.comments // []')
         created_at=$(echo "$issue" | jq -r '.createdAt // ""')
+        issue_state=$(echo "$issue" | jq -r '.state // "open"')
 
-        log_info "Processing issue #$number ($((i+1))/$TOTAL_ISSUES)"
+        log_info "Processing issue #$number ($((i+1))/$TOTAL_ISSUES) [${issue_state}]"
 
         # Pass expected number if preserve-numbers mode is enabled
         local expected_number=""
@@ -868,7 +877,7 @@ main() {
         fi
 
         local result=0
-        create_fizzy_card "$title" "$body" "$labels_json" "$comments_json" "$number" "$created_at" "$expected_number" || result=$?
+        create_fizzy_card "$title" "$body" "$labels_json" "$comments_json" "$number" "$created_at" "$expected_number" "$issue_state" || result=$?
 
         if [[ $result -eq 0 ]]; then
             SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
