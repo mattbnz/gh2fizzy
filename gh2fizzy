@@ -33,6 +33,7 @@ CLOSE_ISSUES=false
 ADD_MIGRATED_LABEL=false
 PRESERVE_NUMBERS=false
 ISSUES_FILE=""  # Cache file for GitHub issues JSON
+DUMP_BOARD_ID=""  # Board ID for placeholder cards (auto-created if needed)
 
 # Counters for summary
 TOTAL_ISSUES=0
@@ -573,6 +574,96 @@ create_fizzy_card() {
     fi
 }
 
+# Find or create the "Dump" board for placeholder cards
+get_or_create_dump_board() {
+    local fizzy_opts=""
+    [[ -n "$FIZZY_ACCOUNT_ID" ]] && fizzy_opts+=" --account $FIZZY_ACCOUNT_ID"
+
+    # Look for existing Dump board
+    local boards_response
+    boards_response=$(fizzy board list $fizzy_opts 2>/dev/null) || true
+
+    DUMP_BOARD_ID=$(echo "$boards_response" | jq -r '.data[] | select(.name == "Dump") | .id' 2>/dev/null | head -1)
+
+    if [[ -n "$DUMP_BOARD_ID" && "$DUMP_BOARD_ID" != "null" ]]; then
+        log_verbose "Found existing Dump board: $DUMP_BOARD_ID"
+        return 0
+    fi
+
+    # Create the Dump board
+    log_info "Creating Dump board for placeholder cards..."
+    local create_response
+    create_response=$(fizzy board create --name "Dump" $fizzy_opts 2>&1) || true
+
+    DUMP_BOARD_ID=$(echo "$create_response" | jq -r '.data.id // empty' 2>/dev/null)
+
+    if [[ -z "$DUMP_BOARD_ID" || "$DUMP_BOARD_ID" == "null" ]]; then
+        log_error "Failed to create Dump board"
+        return 1
+    fi
+
+    log_info "Created Dump board: $DUMP_BOARD_ID"
+}
+
+# Create a placeholder card in the Dump board to consume a card number
+create_placeholder_card() {
+    local target_number="$1"
+    local fizzy_opts=""
+    [[ -n "$FIZZY_ACCOUNT_ID" ]] && fizzy_opts+=" --account $FIZZY_ACCOUNT_ID"
+
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log_verbose "[DRY-RUN] Would create placeholder card #$target_number in Dump board"
+        return 0
+    fi
+
+    local response
+    response=$(fizzy card create \
+        $fizzy_opts \
+        --board "$DUMP_BOARD_ID" \
+        --title "Placeholder #$target_number (PR or deleted issue)" 2>&1) || true
+
+    local success
+    success=$(echo "$response" | jq -r '.success // false' 2>/dev/null) || success="false"
+
+    if [[ "$success" != "true" ]]; then
+        log_error "Failed to create placeholder card"
+        return 1
+    fi
+
+    log_verbose "Created placeholder card #$target_number in Dump board"
+}
+
+# Fill gaps in card numbers by creating placeholder cards
+# Returns the number of placeholders created, or 1 on error
+fill_number_gaps() {
+    local current_max="$1"  # Current highest card number in Fizzy
+    local target_number="$2"  # The issue number we want to create next
+
+    local gaps_to_fill=$((target_number - current_max - 1))
+
+    if [[ $gaps_to_fill -le 0 ]]; then
+        return 0
+    fi
+
+    log_info "Filling $gaps_to_fill gap(s) before issue #$target_number..."
+
+    # Ensure Dump board exists
+    if [[ -z "$DUMP_BOARD_ID" ]]; then
+        get_or_create_dump_board || return 1
+    fi
+
+    local filled=0
+    for ((n = current_max + 1; n < target_number; n++)); do
+        if ! create_placeholder_card "$n"; then
+            log_error "Failed to fill gap at #$n"
+            return 1
+        fi
+        filled=$((filled + 1))
+    done
+
+    echo "$filled"
+}
+
 post_migration_github() {
     local issue_number="$1"
     local repo_flag=""
@@ -666,6 +757,9 @@ main() {
 
     log_info "Found $TOTAL_ISSUES issue(s) from GitHub"
 
+    # Track current max card number for preserve-numbers mode (account-wide)
+    local current_max_card=0
+
     # Sort and filter issues if preserve-numbers mode is enabled
     if [[ "$PRESERVE_NUMBERS" == "true" ]]; then
         log_info "Sorting issues by number for preserve-numbers mode..."
@@ -676,13 +770,32 @@ main() {
         local fizzy_opts=""
         [[ -n "$FIZZY_ACCOUNT_ID" ]] && fizzy_opts+=" --account $FIZZY_ACCOUNT_ID"
 
+        # Get cards from target board for filtering already-migrated issues
         local existing_cards
         existing_cards=$(fizzy card list --board "$BOARD_ID" $fizzy_opts 2>/dev/null) || true
         local existing_numbers
         existing_numbers=$(echo "$existing_cards" | jq -r '.data[].number // empty' 2>/dev/null | sort -n | tr '\n' ' ')
 
+        # Find max card number across ALL boards (card numbers are account-wide)
+        log_info "Finding highest card number in account..."
+        local all_boards
+        all_boards=$(fizzy board list $fizzy_opts 2>/dev/null) || true
+        local board_ids
+        board_ids=$(echo "$all_boards" | jq -r '.data[].id // empty' 2>/dev/null)
+
+        for board_id in $board_ids; do
+            local board_cards
+            board_cards=$(fizzy card list --board "$board_id" $fizzy_opts 2>/dev/null) || true
+            local board_max
+            board_max=$(echo "$board_cards" | jq '[.data[].number // 0] | max // 0' 2>/dev/null) || board_max=0
+            if [[ "$board_max" -gt "$current_max_card" ]]; then
+                current_max_card="$board_max"
+            fi
+        done
+        log_verbose "Current max card number in account: $current_max_card"
+
         if [[ -n "$existing_numbers" ]]; then
-            log_verbose "Existing card numbers: $existing_numbers"
+            log_verbose "Existing card numbers in target board: $existing_numbers"
 
             # Get existing card numbers as JSON array for efficient filtering
             local existing_numbers_json
@@ -733,7 +846,22 @@ main() {
 
         # Pass expected number if preserve-numbers mode is enabled
         local expected_number=""
-        [[ "$PRESERVE_NUMBERS" == "true" ]] && expected_number="$number"
+        if [[ "$PRESERVE_NUMBERS" == "true" ]]; then
+            expected_number="$number"
+
+            # Fill gaps with placeholder cards if needed
+            if [[ "$number" -gt $((current_max_card + 1)) ]]; then
+                local gaps_filled
+                gaps_filled=$(fill_number_gaps "$current_max_card" "$number")
+                if [[ $? -ne 0 ]]; then
+                    log_error "Failed to fill number gaps before issue #$number"
+                    FAIL_COUNT=$((FAIL_COUNT + 1))
+                    print_summary
+                    exit 6
+                fi
+                current_max_card=$((number - 1))
+            fi
+        fi
 
         local result=0
         create_fizzy_card "$title" "$body" "$labels_json" "$comments_json" "$number" "$created_at" "$expected_number" || result=$?
@@ -741,6 +869,8 @@ main() {
         if [[ $result -eq 0 ]]; then
             SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
             post_migration_github "$number"
+            # Update current max card number
+            [[ "$PRESERVE_NUMBERS" == "true" ]] && current_max_card="$number"
         elif [[ $result -eq 2 ]]; then
             # Number mismatch - abort immediately
             log_error "Aborting migration due to card number mismatch"
