@@ -30,6 +30,7 @@ VERBOSE=false
 QUIET=false
 CLOSE_ISSUES=false
 ADD_MIGRATED_LABEL=false
+PRESERVE_NUMBERS=false
 
 # Counters for summary
 TOTAL_ISSUES=0
@@ -107,6 +108,8 @@ BEHAVIOR:
     -q, --quiet             Suppress non-error output
     --close-issues          Close GitHub issues after migration
     --add-migrated-label    Add "migrated-to-fizzy" label to issues
+    --preserve-numbers      Create cards in issue number order and verify
+                            Fizzy assigns matching card numbers (aborts on mismatch)
 
 OTHER:
     -h, --help              Show this help message
@@ -199,6 +202,10 @@ parse_args() {
                 ;;
             --add-migrated-label)
                 ADD_MIGRATED_LABEL=true
+                shift
+                ;;
+            --preserve-numbers)
+                PRESERVE_NUMBERS=true
                 shift
                 ;;
             *)
@@ -411,6 +418,7 @@ create_fizzy_card() {
     local comments_json="$4"
     local issue_number="$5"
     local created_at="$6"
+    local expected_number="${7:-}"  # Optional: if set, verify card number matches
 
     log_verbose "Creating card for issue #$issue_number: $title"
 
@@ -484,9 +492,19 @@ create_fizzy_card() {
     fi
 
     if [[ -z "$card_number" || "$card_number" == "null" ]]; then
+        if [[ -n "$expected_number" ]]; then
+            log_error "Cannot verify card number for issue #$issue_number - card number unavailable"
+            return 2  # Special exit code for number verification failure
+        fi
         log_success "Created card for issue #$issue_number (card number unavailable)"
         log_warn "Unable to retrieve card number - skipping tags and comments"
         return 0
+    fi
+
+    # Verify card number matches expected (if preserve-numbers mode)
+    if [[ -n "$expected_number" && "$card_number" != "$expected_number" ]]; then
+        log_error "Card number mismatch! Expected #$expected_number but got #$card_number"
+        return 2  # Special exit code for number verification failure
     fi
 
     log_success "Created card #$card_number for issue #$issue_number"
@@ -602,6 +620,12 @@ main() {
 
     log_info "Found $TOTAL_ISSUES issue(s) to migrate"
 
+    # Sort issues by number if preserve-numbers mode is enabled
+    if [[ "$PRESERVE_NUMBERS" == "true" ]]; then
+        log_info "Sorting issues by number for preserve-numbers mode..."
+        issues_json=$(echo "$issues_json" | jq 'sort_by(.number)')
+    fi
+
     # Process each issue
     local i=0
     while [[ $i -lt $TOTAL_ISSUES ]]; do
@@ -618,9 +642,22 @@ main() {
 
         log_info "Processing issue #$number ($((i+1))/$TOTAL_ISSUES)"
 
-        if create_fizzy_card "$title" "$body" "$labels_json" "$comments_json" "$number" "$created_at"; then
+        # Pass expected number if preserve-numbers mode is enabled
+        local expected_number=""
+        [[ "$PRESERVE_NUMBERS" == "true" ]] && expected_number="$number"
+
+        local result=0
+        create_fizzy_card "$title" "$body" "$labels_json" "$comments_json" "$number" "$created_at" "$expected_number" || result=$?
+
+        if [[ $result -eq 0 ]]; then
             SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
             post_migration_github "$number"
+        elif [[ $result -eq 2 ]]; then
+            # Number mismatch - abort immediately
+            log_error "Aborting migration due to card number mismatch"
+            FAIL_COUNT=$((FAIL_COUNT + 1))
+            print_summary
+            exit 6
         else
             FAIL_COUNT=$((FAIL_COUNT + 1))
         fi
