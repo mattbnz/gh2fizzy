@@ -32,6 +32,7 @@ QUIET=false
 CLOSE_ISSUES=false
 ADD_MIGRATED_LABEL=false
 PRESERVE_NUMBERS=false
+ISSUES_FILE=""  # Cache file for GitHub issues JSON
 
 # Counters for summary
 TOTAL_ISSUES=0
@@ -111,6 +112,8 @@ BEHAVIOR:
     --add-migrated-label    Add "migrated-to-fizzy" label to issues
     --preserve-numbers      Create cards in issue number order and verify
                             Fizzy assigns matching card numbers (aborts on mismatch)
+    --issues-file FILE      Read/write GitHub issues JSON from FILE (skips API call
+                            if file exists; saves response if fetched)
 
 OTHER:
     -h, --help              Show this help message
@@ -209,6 +212,10 @@ parse_args() {
             --preserve-numbers)
                 PRESERVE_NUMBERS=true
                 shift
+                ;;
+            --issues-file)
+                ISSUES_FILE="$2"
+                shift 2
                 ;;
             *)
                 die "Unknown argument: $1\nRun 'gh2fizzy --help' for usage." 2
@@ -623,9 +630,29 @@ main() {
         LIMIT=10000  # Fetch all issues
     fi
 
-    # Fetch issues
+    # Fetch issues (from cache file or GitHub API)
     local issues_json
-    issues_json=$(fetch_issues)
+    local fetched_from_api=false
+
+    if [[ -n "$ISSUES_FILE" && -f "$ISSUES_FILE" ]]; then
+        log_info "Reading issues from cache file: $ISSUES_FILE"
+        issues_json=$(cat "$ISSUES_FILE")
+    else
+        issues_json=$(fetch_issues)
+        fetched_from_api=true
+
+        # Save to cache file if specified
+        if [[ -n "$ISSUES_FILE" ]]; then
+            echo "$issues_json" > "$ISSUES_FILE"
+            log_info "Saved issues to cache file: $ISSUES_FILE"
+        elif [[ "$PRESERVE_NUMBERS" == "true" ]]; then
+            # Auto-create cache file for preserve-numbers mode
+            local cache_file="/tmp/gh2fizzy-issues-$(date +%Y%m%d-%H%M%S).json"
+            echo "$issues_json" > "$cache_file"
+            log_info "Saved issues to cache file: $cache_file"
+            log_info "Re-run with --issues-file $cache_file to skip GitHub API call"
+        fi
+    fi
 
     # Restore original limit
     LIMIT="$original_limit"
