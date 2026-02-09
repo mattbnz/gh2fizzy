@@ -7,6 +7,7 @@ Migrate GitHub Issues to Fizzy Cards - a command-line tool that transfers issues
 - Migrate GitHub issues to Fizzy cards with title and description
 - Convert GitHub labels to Fizzy tags (auto-created)
 - Preserve all comments with author attribution and timestamps
+- **Multi-identity support**: Map GitHub users to Fizzy accounts to preserve authorship
 - Filter issues by state, labels, assignee, or milestone
 - Migrate specific issues by number
 - Dry-run mode to preview migrations
@@ -122,6 +123,8 @@ gh2fizzy --board BOARD_ID [OPTIONS]
 |----------|-------------|---------|
 | `--account` | Fizzy account ID | `$FIZZY_ACCOUNT` |
 | `--column` | Place cards in specific column | Triage |
+| `--identity-map` | JSON file mapping GitHub usernames to Fizzy auth tokens | None |
+| `--default-account` | GitHub username from map to use for unmapped users and system comments | None |
 
 ### Behavior Options
 
@@ -198,6 +201,33 @@ gh2fizzy --board 12345 --column 67890
 gh2fizzy --board 12345 --dry-run --verbose
 ```
 
+### Multi-Identity Support
+
+Preserve original authorship by mapping GitHub usernames to Fizzy authentication tokens.
+
+**Create identity-map.json:**
+```json
+{
+  "alice-gh": "fizzy_token_alice...",
+  "bob-github": "fizzy_token_bob...",
+  "system-bot": "fizzy_token_bot..."
+}
+```
+
+**Get tokens:** Each user generates an API token from their Fizzy profile settings.
+
+**Run migration:**
+```bash
+gh2fizzy --board 12345 \
+  --identity-map identity-map.json \
+  --default-account system-bot
+```
+
+**Result:**
+- Cards created as the GitHub issue author
+- Comments created as the GitHub comment author
+- Unmapped users and system events use the `system-bot` account from the map
+
 ## Data Mapping
 
 | GitHub | Fizzy |
@@ -205,25 +235,25 @@ gh2fizzy --board 12345 --dry-run --verbose
 | Issue title | Card title |
 | Issue body | Card description |
 | Issue labels | Card tags (auto-created) |
-| Issue comments | Single card comment with attribution |
+| Issue comments | Individual card comments with author attribution |
+| Issue author | Card creator (when using `--identity-map`) |
+| Comment authors | Comment creators (when using `--identity-map`) |
 
 ### Comment Format
 
-GitHub comments are combined into a single Fizzy comment:
+Each GitHub comment is migrated as an individual Fizzy comment:
 
+**Without identity mapping:**
 ```markdown
-**Migrated Comments from GitHub Issues**
-
----
-**@octocat** commented on 2024-01-15 10:30:
+*Migrated from GitHub - originally by @octocat*
 
 Original comment text here...
-
----
-**@developer** commented on 2024-01-16 14:22:
-
-Another comment with full attribution...
 ```
+
+**With identity mapping:**
+Comments are created directly as the mapped Fizzy user, preserving the original authorship while still noting the GitHub migration source.
+
+Timeline events (issue closed, referenced in commits, etc.) are also migrated as comments and always use the default account.
 
 ## Exit Codes
 

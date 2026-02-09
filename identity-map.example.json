@@ -1,0 +1,6 @@
+{
+  "github-user1": "fizzy_auth_token_for_user1",
+  "github-user2": "fizzy_auth_token_for_user2",
+  "octocat": "fizzy_auth_token_for_octocat",
+  "system-bot": "fizzy_auth_token_for_bot"
+}
