@@ -1375,13 +1375,18 @@ main() {
         # (these numbers are unreachable since Fizzy assigns numbers sequentially)
         if [[ "$current_max_card" -gt 0 ]]; then
             local reachable_before=$TOTAL_ISSUES
+            local issues_json_before_filter="$issues_json"
             issues_json=$(echo "$issues_json" | jq --argjson max "$current_max_card" \
                 '[.[] | select(.number > $max)]')
             TOTAL_ISSUES=$(echo "$issues_json" | jq 'length')
 
             local unreachable=$((reachable_before - TOTAL_ISSUES))
             if [[ $unreachable -gt 0 ]]; then
+                local unreachable_numbers
+                unreachable_numbers=$(echo "$issues_json_before_filter" | jq -r --argjson max "$current_max_card" \
+                    '[.[] | select(.number <= $max) | .number] | sort | map(tostring) | join(", ")')
                 log_warn "Skipped $unreachable issue(s) with numbers at or below current max card #$current_max_card (unreachable)"
+                log_warn "Unreachable issues: $unreachable_numbers"
             fi
         fi
 
