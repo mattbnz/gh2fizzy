@@ -321,6 +321,29 @@ validate_args() {
         die "Missing required argument: --board BOARD_ID\nRun 'gh2fizzy --help' for usage." 2
     fi
 
+    # Load account ID from .fizzy.yaml if not provided via --account
+    if [[ -z "$FIZZY_ACCOUNT_ID" ]]; then
+        if [[ -f ".fizzy.yaml" ]]; then
+            log_verbose "Reading account from .fizzy.yaml"
+            FIZZY_ACCOUNT_ID=$(grep -E '^\s*account:\s*' .fizzy.yaml | sed -E 's/^\s*account:\s*//' | tr -d '"' | tr -d "'" | head -1)
+            if [[ -n "$FIZZY_ACCOUNT_ID" ]]; then
+                log_verbose "Loaded account from .fizzy.yaml: $FIZZY_ACCOUNT_ID"
+            fi
+        fi
+    fi
+
+    # Also try to load base URL from .fizzy.yaml if needed later
+    if [[ -z "$FIZZY_BASE_URL" && -f ".fizzy.yaml" ]]; then
+        log_verbose "Reading api_url from .fizzy.yaml"
+        local api_url
+        api_url=$(grep -E '^\s*api_url:\s*' .fizzy.yaml | sed -E 's/^\s*api_url:\s*//' | tr -d '"' | tr -d "'" | head -1)
+        if [[ -n "$api_url" ]]; then
+            # Remove trailing slash
+            FIZZY_BASE_URL="${api_url%/}"
+            log_verbose "Loaded base URL from .fizzy.yaml: $FIZZY_BASE_URL"
+        fi
+    fi
+
     # Default to 'all' state when preserve-numbers is enabled (unless explicitly set)
     if [[ "$PRESERVE_NUMBERS" == "true" && "$STATE_SET" == "false" ]]; then
         STATE="all"
@@ -409,16 +432,20 @@ check_auth() {
         fi
     fi
 
-    # Extract base URL from user URL in identity response
-    local user_url
-    user_url=$(echo "$identity_response" | jq -r '.data.accounts[0].user.url // empty' 2>/dev/null)
-    if [[ -n "$user_url" ]]; then
-        # Extract base URL by removing the /users/... path
-        FIZZY_BASE_URL=$(echo "$user_url" | sed 's|/users/.*||')
-        log_verbose "Fizzy base URL: $FIZZY_BASE_URL"
+    # Extract base URL from user URL in identity response (if not already set from .fizzy.yaml)
+    if [[ -z "$FIZZY_BASE_URL" ]]; then
+        local user_url
+        user_url=$(echo "$identity_response" | jq -r '.data.accounts[0].user.url // empty' 2>/dev/null)
+        if [[ -n "$user_url" ]]; then
+            # Extract base URL by removing the /users/... path
+            FIZZY_BASE_URL=$(echo "$user_url" | sed 's|/users/.*||')
+            log_verbose "Fizzy base URL from identity: $FIZZY_BASE_URL"
+        else
+            log_warn "Could not extract Fizzy base URL from identity response"
+            log_verbose "Identity response: $identity_response"
+        fi
     else
-        log_warn "Could not extract Fizzy base URL from identity response"
-        log_verbose "Identity response: $identity_response"
+        log_verbose "Using Fizzy base URL from config: $FIZZY_BASE_URL"
     fi
 
     log_verbose "Authentication verified"
