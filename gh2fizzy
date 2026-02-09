@@ -981,23 +981,15 @@ create_fizzy_card() {
             local closure_timestamp="${closed_at:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}"
             local closure_url="${FIZZY_BASE_URL}/${FIZZY_ACCOUNT_ID}/cards/${card_number}/closure"
 
-            local closure_response
-            closure_response=$(curl -s -X POST "$closure_url" \
+            curl -s -X POST "$closure_url" \
                 -H "Authorization: Bearer $card_token" \
                 -H "Content-Type: application/json" \
                 -H "Sec-Fetch-Site: same-origin" \
                 -H "Sec-Fetch-Mode: cors" \
                 -H "Sec-Fetch-Dest: empty" \
-                -d "{\"closure\": {\"closed_at\": \"$closure_timestamp\"}}" 2>&1)
-
-            local closure_success
-            closure_success=$(echo "$closure_response" | jq -r '.success // false' 2>/dev/null) || closure_success="false"
-
-            if [[ "$closure_success" != "true" ]]; then
-                local error_msg
-                error_msg=$(echo "$closure_response" | jq -r '.error.message // .error // "Unknown error"' 2>/dev/null) || error_msg="$closure_response"
-                log_warn "Failed to close card #$card_number via API: $error_msg"
-            fi
+                -d "{\"closure\": {\"closed_at\": \"$closure_timestamp\"}}" \
+                >/dev/null 2>&1 || \
+                log_warn "Failed to close card #$card_number"
         else
             log_warn "Cannot close card #$card_number - missing required config:"
             [[ -z "$FIZZY_BASE_URL" ]] && log_warn "  - FIZZY_BASE_URL is empty"
@@ -1080,23 +1072,15 @@ create_placeholder_card() {
         closure_timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)
         local closure_url="${FIZZY_BASE_URL}/${FIZZY_ACCOUNT_ID}/cards/${target_number}/closure"
 
-        local closure_response
-        closure_response=$(curl -s -X POST "$closure_url" \
+        curl -s -X POST "$closure_url" \
             -H "Authorization: Bearer $default_token" \
             -H "Content-Type: application/json" \
             -H "Sec-Fetch-Site: same-origin" \
             -H "Sec-Fetch-Mode: cors" \
             -H "Sec-Fetch-Dest: empty" \
-            -d "{\"closure\": {\"closed_at\": \"$closure_timestamp\"}}" 2>&1)
-
-        local closure_success
-        closure_success=$(echo "$closure_response" | jq -r '.success // false' 2>/dev/null) || closure_success="false"
-
-        if [[ "$closure_success" != "true" ]]; then
-            local error_msg
-            error_msg=$(echo "$closure_response" | jq -r '.error.message // .error // "Unknown error"' 2>/dev/null) || error_msg="$closure_response"
-            log_warn "Failed to close placeholder card #$target_number via API: $error_msg"
-        fi
+            -d "{\"closure\": {\"closed_at\": \"$closure_timestamp\"}}" \
+            >/dev/null 2>&1 || \
+            log_warn "Failed to close placeholder card #$target_number"
     else
         log_warn "Cannot close placeholder card #$target_number - missing required config:"
         [[ -z "$FIZZY_BASE_URL" ]] && log_warn "  - FIZZY_BASE_URL is empty"
