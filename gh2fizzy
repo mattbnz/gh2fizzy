@@ -635,9 +635,15 @@ create_fizzy_comment() {
         comment_fizzy_opts+=" --account $FIZZY_ACCOUNT_ID"
     fi
 
-    # Format the comment body with author attribution (unless raw mode)
+    # Format the comment body with author attribution
+    # Skip attribution if: raw mode (timeline events) OR author is in identity map
     local formatted_body
-    if [[ "$raw" == "true" ]]; then
+    local author_is_mapped=false
+    if [[ "$raw" != "true" && -n "$author" && -n "${IDENTITY_MAP[$author]:-}" ]]; then
+        author_is_mapped=true
+    fi
+
+    if [[ "$raw" == "true" || "$author_is_mapped" == "true" ]]; then
         formatted_body="$body"
     else
         formatted_body="*Migrated from GitHub - originally by @${author}*\n\n${body}"
