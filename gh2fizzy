@@ -452,14 +452,14 @@ convert_commit_references() {
     fi
 
     # Convert commit SHAs to GitHub links
-    # Match exactly 7 or 40 character hex strings (common GitHub SHA formats)
+    # Match hex strings from 7 to 40 characters (GitHub's commit SHA range)
     # Don't match if preceded by [ or hex char (already in markdown link or part of longer string)
     # Don't match if followed by hex char (part of longer string)
     # Use @ as delimiter to avoid conflicts with / in URLs
     local github_base="https://github.com/${repo_slug}/commit"
 
-    # Use alternation to match exactly 7 OR exactly 40 hex chars
-    echo "$text" | sed -E "s@(^|[^[0-9a-f])([0-9a-f]{40}|[0-9a-f]{7})([^0-9a-f]|$)@\1[\`\2\`](${github_base}/\2)\3@g"
+    # Match any hex string from 7-40 chars with word boundaries
+    echo "$text" | sed -E "s@(^|[^[0-9a-f])([0-9a-f]{7,40})([^0-9a-f]|$)@\1[\`\2\`](${github_base}/\2)\3@g"
 }
 
 # Convert markdown to HTML (converter is required, checked in check_dependencies)

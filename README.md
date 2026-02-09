@@ -283,20 +283,20 @@ Commit SHA references in issue descriptions and comments are automatically conve
 
 **GitHub markdown:**
 ```markdown
-Fixed in abc1234 and also 1234567890abcdef1234567890abcdef12345678
+Fixed in d5cf4a198 and also 1234567890abcdef1234567890abcdef12345678
 ```
 
 **Converted to:**
 ```markdown
-Fixed in [`abc1234`](https://github.com/owner/repo/commit/abc1234) and also [`1234567890abcdef1234567890abcdef12345678`](https://github.com/owner/repo/commit/1234567890abcdef12345678)
+Fixed in [`d5cf4a198`](https://github.com/owner/repo/commit/d5cf4a198) and also [`1234567890abcdef1234567890abcdef12345678`](https://github.com/owner/repo/commit/1234567890abcdef12345678)
 ```
 
 **Notes:**
-- Only 7-character (short) or 40-character (full) SHAs are converted
+- Hex strings from 7-40 characters are converted (GitHub's commit SHA range)
 - Must be lowercase hexadecimal (0-9, a-f)
 - Must be standalone (not part of a longer hex string)
 - Links point to the repository being migrated from
-- Other hex strings (8-39 chars, or with uppercase) are not converted to avoid false positives
+- Shorter hex strings (6 chars or less) and uppercase are not converted to avoid false positives
 
 ## Exit Codes
 
