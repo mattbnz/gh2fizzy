@@ -416,6 +416,9 @@ check_auth() {
         # Extract base URL by removing the /users/... path
         FIZZY_BASE_URL=$(echo "$user_url" | sed 's|/users/.*||')
         log_verbose "Fizzy base URL: $FIZZY_BASE_URL"
+    else
+        log_warn "Could not extract Fizzy base URL from identity response"
+        log_verbose "Identity response: $identity_response"
     fi
 
     log_verbose "Authentication verified"
@@ -958,7 +961,10 @@ create_fizzy_card() {
                 >/dev/null 2>&1 || \
                 log_warn "Failed to close card #$card_number via API"
         else
-            log_warn "Cannot close card #$card_number - missing Fizzy base URL, account ID, or token"
+            log_warn "Cannot close card #$card_number - missing required config:"
+            [[ -z "$FIZZY_BASE_URL" ]] && log_warn "  - FIZZY_BASE_URL is empty"
+            [[ -z "$FIZZY_ACCOUNT_ID" ]] && log_warn "  - FIZZY_ACCOUNT_ID is empty (use --account)"
+            [[ -z "$card_token" ]] && log_warn "  - card_token is empty"
         fi
     fi
 
@@ -1043,7 +1049,10 @@ create_placeholder_card() {
             >/dev/null 2>&1 || \
             log_warn "Failed to close placeholder card #$target_number via API"
     else
-        log_warn "Cannot close placeholder card #$target_number - missing Fizzy base URL, account ID, or token"
+        log_warn "Cannot close placeholder card #$target_number - missing required config:"
+        [[ -z "$FIZZY_BASE_URL" ]] && log_warn "  - FIZZY_BASE_URL is empty"
+        [[ -z "$FIZZY_ACCOUNT_ID" ]] && log_warn "  - FIZZY_ACCOUNT_ID is empty (use --account)"
+        [[ -z "$default_token" ]] && log_warn "  - default_token is empty"
     fi
 
     log_verbose "Created and closed placeholder card #$target_number in Dump board"
