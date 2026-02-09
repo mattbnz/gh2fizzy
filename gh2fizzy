@@ -267,14 +267,13 @@ check_dependencies() {
         missing+=("jq (JSON processor)")
     fi
 
-    # Check for markdown converter (optional but recommended)
-    if ! command -v cmark &>/dev/null && ! command -v pandoc &>/dev/null; then
-        log_warn "No markdown converter found (cmark or pandoc). Markdown will not be converted to HTML."
-        MARKDOWN_CONVERTER=""
-    elif command -v cmark &>/dev/null; then
+    # Check for markdown converter (required)
+    if command -v cmark &>/dev/null; then
         MARKDOWN_CONVERTER="cmark"
-    else
+    elif command -v pandoc &>/dev/null; then
         MARKDOWN_CONVERTER="pandoc"
+    else
+        missing+=("cmark or pandoc (markdown converter)")
     fi
 
     if [[ ${#missing[@]} -gt 0 ]]; then
@@ -316,20 +315,20 @@ check_auth() {
     log_verbose "Authentication verified"
 }
 
-# Convert markdown to HTML if converter is available
+# Convert markdown to HTML (converter is required, checked in check_dependencies)
 markdown_to_html() {
     local markdown="$1"
 
-    if [[ -z "$MARKDOWN_CONVERTER" ]]; then
-        # No converter, return as-is
-        echo "$markdown"
-        return
-    fi
-
     if [[ "$MARKDOWN_CONVERTER" == "cmark" ]]; then
-        echo "$markdown" | cmark --unsafe 2>/dev/null || echo "$markdown"
+        echo "$markdown" | cmark --unsafe 2>/dev/null || {
+            log_error "Markdown conversion failed with cmark"
+            return 1
+        }
     else
-        echo "$markdown" | pandoc -f gfm -t html 2>/dev/null || echo "$markdown"
+        echo "$markdown" | pandoc -f gfm -t html 2>/dev/null || {
+            log_error "Markdown conversion failed with pandoc"
+            return 1
+        }
     fi
 }
 
