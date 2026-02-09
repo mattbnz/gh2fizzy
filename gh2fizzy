@@ -617,6 +617,43 @@ fetch_timeline_events() {
     }]'
 }
 
+# Fetch parent/child (sub-issue) relationships for a GitHub issue
+fetch_issue_relationships() {
+    local repo_slug="$1"
+    local issue_number="$2"
+
+    if [[ -z "$repo_slug" ]]; then
+        repo_slug=$(gh repo view --json nameWithOwner -q '.nameWithOwner' 2>/dev/null) || repo_slug=""
+    fi
+
+    local parent=""
+    local children="[]"
+
+    # Fetch sub-issues (children) — only use output if API call succeeds
+    local sub_issues
+    if sub_issues=$(gh api "repos/${repo_slug}/issues/${issue_number}/sub_issues" --jq '[.[].number]' 2>/dev/null); then
+        if [[ -n "$sub_issues" && "$sub_issues" != "null" && "$sub_issues" != "[]" ]]; then
+            children="$sub_issues"
+        fi
+    fi
+
+    # Fetch parent issue — only use output if API call succeeds
+    local parent_number
+    if parent_number=$(gh api "repos/${repo_slug}/issues/${issue_number}/parent" --jq '.number' 2>/dev/null); then
+        if [[ -n "$parent_number" && "$parent_number" != "null" ]]; then
+            parent="$parent_number"
+        fi
+    fi
+
+    # Build result JSON
+    local parent_json="null"
+    if [[ -n "$parent" ]]; then
+        parent_json="$parent"
+    fi
+
+    echo "{\"parent\": ${parent_json}, \"children\": ${children}}"
+}
+
 format_timeline_comment() {
     local event="$1"
     local actor="$2"
@@ -760,6 +797,7 @@ create_fizzy_card() {
     local issue_state="${8:-open}"  # GitHub issue state: open or closed
     local author="${9:-unknown}"  # GitHub issue author
     local closed_at="${10:-}"  # GitHub issue closed_at timestamp
+    local relationships_json="${11:-}"  # Parent/child issue relationships JSON
 
     log_verbose "Creating card for issue #$issue_number: $title"
 
@@ -797,6 +835,19 @@ create_fizzy_card() {
             log_verbose "[DRY-RUN] Would add $comment_count individual comment(s)"
         fi
 
+        # Show relationship info
+        if [[ -n "$relationships_json" ]]; then
+            local dr_parent dr_children
+            dr_parent=$(echo "$relationships_json" | jq -r '.parent // empty' 2>/dev/null) || dr_parent=""
+            dr_children=$(echo "$relationships_json" | jq -r '.children // [] | map("#\(.)") | join(", ")' 2>/dev/null) || dr_children=""
+            if [[ -n "$dr_children" ]]; then
+                log_verbose "[DRY-RUN] Parent of: $dr_children"
+            fi
+            if [[ -n "$dr_parent" ]]; then
+                log_verbose "[DRY-RUN] Child of: #$dr_parent"
+            fi
+        fi
+
         return 0
     fi
 
@@ -810,6 +861,21 @@ create_fizzy_card() {
         github_url="https://github.com/${repo_slug}/issues/${issue_number}"
     fi
 
+    # Build relationship suffix for footer
+    local relationship_suffix=""
+    if [[ -n "$relationships_json" ]]; then
+        local parent children_csv
+        parent=$(echo "$relationships_json" | jq -r '.parent // empty' 2>/dev/null) || parent=""
+        children_csv=$(echo "$relationships_json" | jq -r '.children // [] | map("#\(.)") | join(", ")' 2>/dev/null) || children_csv=""
+
+        if [[ -n "$children_csv" ]]; then
+            relationship_suffix=", parent of ${children_csv}"
+        fi
+        if [[ -n "$parent" ]]; then
+            relationship_suffix=", child of #${parent}"
+        fi
+    fi
+
     # Append footer with GitHub link to description
     local body_with_footer="$body"
     if [[ -n "$github_url" ]]; then
@@ -817,7 +883,7 @@ create_fizzy_card() {
 
 ---
 
-<small><em>Imported from <a href=\"${github_url}\">${github_url}</a></em></small>"
+<small><em>Imported from <a href=\"${github_url}\">${github_url}</a>${relationship_suffix}</em></small>"
     fi
 
     # Convert issue references and commit references, then markdown to HTML
@@ -1351,6 +1417,11 @@ main() {
 
         log_info "Processing issue #$number ($((i+1))/$TOTAL_ISSUES) [${issue_state}]"
 
+        # Fetch parent/child relationships
+        local relationships_json
+        relationships_json=$(fetch_issue_relationships "$REPO" "$number")
+        log_verbose "Issue #$number relationships: $relationships_json"
+
         # Pass expected number if preserve-numbers mode is enabled
         local expected_number=""
         if [[ "$PRESERVE_NUMBERS" == "true" ]]; then
@@ -1379,7 +1450,7 @@ main() {
 
         local result=0
         MISMATCH_ACTUAL_NUMBER=""
-        create_fizzy_card "$title" "$body" "$labels_json" "$comments_json" "$number" "$created_at" "$expected_number" "$issue_state" "$author" "$closed_at" || result=$?
+        create_fizzy_card "$title" "$body" "$labels_json" "$comments_json" "$number" "$created_at" "$expected_number" "$issue_state" "$author" "$closed_at" "$relationships_json" || result=$?
 
         if [[ $result -eq 0 ]]; then
             SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
