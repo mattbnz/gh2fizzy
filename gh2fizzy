@@ -453,6 +453,33 @@ check_auth() {
     log_verbose "Authentication verified"
 }
 
+# Fetch all card numbers from a paginated fizzy card list command
+# Usage: fetch_all_card_numbers_paginated [fizzy card list args...]
+fetch_all_card_numbers_paginated() {
+    local all_nums="[]"
+    local page=1
+
+    while true; do
+        local response
+        response=$(eval "fizzy card list $* --page $page" 2>/dev/null) || break
+
+        local page_nums
+        page_nums=$(echo "$response" | jq '[.data[].number // empty]' 2>/dev/null) || break
+
+        local page_count
+        page_count=$(echo "$page_nums" | jq 'length' 2>/dev/null) || break
+
+        if [[ "$page_count" -eq 0 ]]; then
+            break
+        fi
+
+        all_nums=$(echo "$all_nums" | jq --argjson new "$page_nums" '. + $new') || break
+        page=$((page + 1))
+    done
+
+    echo "$all_nums"
+}
+
 # Convert GitHub issue references (#123) to Fizzy card links
 convert_issue_references() {
     local text="$1"
@@ -1323,17 +1350,13 @@ main() {
 
         local all_card_numbers="[]"
         for board_id in $board_ids; do
-            # Fetch open cards
-            local open_cards
-            open_cards=$(fizzy card list --board "$board_id" --all --sort newest $fizzy_opts 2>/dev/null) || true
+            # Fetch all open card numbers (paginated)
             local open_nums
-            open_nums=$(echo "$open_cards" | jq '[.data[].number // empty]' 2>/dev/null) || open_nums="[]"
+            open_nums=$(fetch_all_card_numbers_paginated --board "$board_id" --all --sort newest $fizzy_opts)
 
-            # Fetch closed cards
-            local closed_cards
-            closed_cards=$(fizzy card list --board "$board_id" --all --indexed-by closed --sort newest $fizzy_opts 2>/dev/null) || true
+            # Fetch all closed card numbers (paginated)
             local closed_nums
-            closed_nums=$(echo "$closed_cards" | jq '[.data[].number // empty]' 2>/dev/null) || closed_nums="[]"
+            closed_nums=$(fetch_all_card_numbers_paginated --board "$board_id" --all --indexed-by closed --sort newest $fizzy_opts)
 
             # Combine with all card numbers
             all_card_numbers=$(echo "$all_card_numbers" | jq --argjson open "$open_nums" --argjson closed "$closed_nums" '. + $open + $closed | unique') || {
