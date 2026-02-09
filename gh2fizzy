@@ -432,12 +432,14 @@ convert_issue_references() {
         return
     fi
 
-    # Convert same-repo issue references: #123 -> [#123](fizzy_url)
-    # Match #<digits> followed by word boundary (space, punctuation, end of line)
-    # Don't match if preceded by [ (already in markdown link) or alphanumeric (like #123ABC)
-    # Use @ as delimiter to avoid conflicts with / in URLs
     local fizzy_url="${FIZZY_BASE_URL}/${FIZZY_ACCOUNT_ID}/cards"
-    echo "$text" | sed -E "s@([^[]|^)#([0-9]+)([^0-9A-Za-z]|$)@\1[#\2](${fizzy_url}/\2)\3@g"
+
+    # First, handle special case: "mentioned this issue in #NNN: Description"
+    # Link the full "#NNN: Description" text (not just #NNN)
+    # Process this before general #NNN to avoid partial matches
+    echo "$text" | \
+        sed -E "s@mentioned this issue in (#([0-9]+): [^\n]+)@mentioned this issue in [\1](${fizzy_url}/\2)@g" | \
+        sed -E "s@([^[]|^)#([0-9]+)([[:space:][:punct:]]|$)@\1[#\2](${fizzy_url}/\2)\3@g"
 }
 
 # Convert commit SHA references to GitHub commit links
