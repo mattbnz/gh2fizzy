@@ -988,6 +988,9 @@ create_fizzy_card() {
             closure_response=$(curl -s -X POST "$closure_url" \
                 -H "Authorization: Bearer $card_token" \
                 -H "Content-Type: application/json" \
+                -H "Sec-Fetch-Site: same-origin" \
+                -H "Sec-Fetch-Mode: cors" \
+                -H "Sec-Fetch-Dest: empty" \
                 -d "{\"closure\": {\"closed_at\": \"$closure_timestamp\"}}" 2>&1)
 
             local closure_success
@@ -1087,6 +1090,9 @@ create_placeholder_card() {
         closure_response=$(curl -s -X POST "$closure_url" \
             -H "Authorization: Bearer $default_token" \
             -H "Content-Type: application/json" \
+            -H "Sec-Fetch-Site: same-origin" \
+            -H "Sec-Fetch-Mode: cors" \
+            -H "Sec-Fetch-Dest: empty" \
             -d "{\"closure\": {\"closed_at\": \"$closure_timestamp\"}}" 2>&1)
 
         local closure_success
