@@ -692,10 +692,13 @@ create_fizzy_comment() {
     fi
 
     # Convert issue references and commit references, then markdown to HTML
+    # Skip commit conversion for timeline events (raw=true) since they already have formatted links
     local comment_file html_body body_with_links
     comment_file=$(mktemp)
     body_with_links=$(convert_issue_references "$(echo -e "$formatted_body")" "$BOARD_ID")
-    body_with_links=$(convert_commit_references "$body_with_links" "$repo_slug")
+    if [[ "$raw" != "true" ]]; then
+        body_with_links=$(convert_commit_references "$body_with_links" "$repo_slug")
+    fi
     html_body=$(markdown_to_html "$body_with_links")
     echo "$html_body" > "$comment_file"
 
