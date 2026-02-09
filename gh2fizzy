@@ -421,6 +421,25 @@ check_auth() {
     log_verbose "Authentication verified"
 }
 
+# Convert GitHub issue references (#123) to Fizzy card links
+convert_issue_references() {
+    local text="$1"
+    local board_id="$2"
+
+    # Only convert if we have a Fizzy base URL and board ID
+    if [[ -z "$FIZZY_BASE_URL" || -z "$board_id" ]]; then
+        echo "$text"
+        return
+    fi
+
+    # Convert same-repo issue references: #123 -> [#123](fizzy_url)
+    # Match #<digits> followed by word boundary (space, punctuation, end of line)
+    # Don't match if preceded by [ (already in markdown link) or alphanumeric (like #123ABC)
+    # Use @ as delimiter to avoid conflicts with / in URLs
+    local fizzy_url="${FIZZY_BASE_URL}/${board_id}"
+    echo "$text" | sed -E "s@([^[]|^)#([0-9]+)([^0-9A-Za-z]|$)@\1[#\2](${fizzy_url}/\2)\3@g"
+}
+
 # Convert markdown to HTML (converter is required, checked in check_dependencies)
 markdown_to_html() {
     local markdown="$1"
@@ -649,10 +668,11 @@ create_fizzy_comment() {
         formatted_body="*Migrated from GitHub - originally by @${author}*\n\n${body}"
     fi
 
-    # Convert markdown to HTML
-    local comment_file html_body
+    # Convert issue references to Fizzy card links, then markdown to HTML
+    local comment_file html_body body_with_links
     comment_file=$(mktemp)
-    html_body=$(markdown_to_html "$(echo -e "$formatted_body")")
+    body_with_links=$(convert_issue_references "$(echo -e "$formatted_body")" "$BOARD_ID")
+    html_body=$(markdown_to_html "$body_with_links")
     echo "$html_body" > "$comment_file"
 
     # Build the fizzy comment create command
@@ -740,10 +760,11 @@ create_fizzy_card() {
 <small><em>Imported from <a href=\"${github_url}\">${github_url}</a></em></small>"
     fi
 
-    # Convert markdown to HTML and create temp file for description
-    local desc_file html_body
+    # Convert issue references to Fizzy card links, then markdown to HTML
+    local desc_file html_body body_with_links
     desc_file=$(mktemp)
-    html_body=$(markdown_to_html "$body_with_footer")
+    body_with_links=$(convert_issue_references "$body_with_footer" "$BOARD_ID")
+    html_body=$(markdown_to_html "$body_with_links")
     echo "$html_body" > "$desc_file"
 
     # Build the fizzy card create command

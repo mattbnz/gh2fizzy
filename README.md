@@ -238,6 +238,7 @@ gh2fizzy --board 12345 \
 | Issue comments | Individual card comments with author attribution |
 | Issue author | Card creator (when using `--identity-map`) |
 | Comment authors | Comment creators (when using `--identity-map`) |
+| Issue references (`#123`) | Converted to Fizzy card links |
 
 ### Comment Format
 
@@ -251,9 +252,29 @@ Original comment text here...
 ```
 
 **With identity mapping:**
-Comments are created directly as the mapped Fizzy user, preserving the original authorship while still noting the GitHub migration source.
+Comments are created directly as the mapped Fizzy user, preserving the original authorship without the attribution prefix.
 
 Timeline events (issue closed, referenced in commits, etc.) are also migrated as comments and always use the default account.
+
+### Issue Reference Linking
+
+GitHub issue references (like `#123`) in issue descriptions and comments are automatically converted to Fizzy card links:
+
+**GitHub markdown:**
+```markdown
+This fixes #42 and is related to #43
+```
+
+**Converted to:**
+```markdown
+This fixes [#42](https://fizzy.example.com/board-id/42) and is related to [#43](https://fizzy.example.com/board-id/43)
+```
+
+**Notes:**
+- Only same-repository references (`#123`) are converted
+- Cross-repository references (`owner/repo#123`) are preserved as-is
+- References that are already part of markdown links are preserved
+- Color codes like `#123ABC` are not converted (requires word boundary after number)
 
 ## Exit Codes
 
