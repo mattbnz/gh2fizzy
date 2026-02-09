@@ -426,8 +426,8 @@ convert_issue_references() {
     local text="$1"
     local board_id="$2"
 
-    # Only convert if we have a Fizzy base URL and board ID
-    if [[ -z "$FIZZY_BASE_URL" || -z "$board_id" ]]; then
+    # Only convert if we have a Fizzy base URL and account ID
+    if [[ -z "$FIZZY_BASE_URL" || -z "$FIZZY_ACCOUNT_ID" ]]; then
         echo "$text"
         return
     fi
@@ -436,7 +436,7 @@ convert_issue_references() {
     # Match #<digits> followed by word boundary (space, punctuation, end of line)
     # Don't match if preceded by [ (already in markdown link) or alphanumeric (like #123ABC)
     # Use @ as delimiter to avoid conflicts with / in URLs
-    local fizzy_url="${FIZZY_BASE_URL}/${board_id}"
+    local fizzy_url="${FIZZY_BASE_URL}/${FIZZY_ACCOUNT_ID}/cards"
     echo "$text" | sed -E "s@([^[]|^)#([0-9]+)([^0-9A-Za-z]|$)@\1[#\2](${fizzy_url}/\2)\3@g"
 }
 
@@ -604,8 +604,8 @@ format_timeline_comment() {
 
     # Construct Fizzy card URL for cross-references
     local source_url=""
-    if [[ -n "$source_number" && "$source_number" != "null" && -n "$board_id" && -n "$FIZZY_BASE_URL" ]]; then
-        source_url="${FIZZY_BASE_URL}/${board_id}/${source_number}"
+    if [[ -n "$source_number" && "$source_number" != "null" && -n "$FIZZY_ACCOUNT_ID" && -n "$FIZZY_BASE_URL" ]]; then
+        source_url="${FIZZY_BASE_URL}/${FIZZY_ACCOUNT_ID}/cards/${source_number}"
     fi
 
     local body=""

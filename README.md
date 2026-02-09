@@ -268,7 +268,7 @@ This fixes #42 and is related to #43
 
 **Converted to:**
 ```markdown
-This fixes [#42](https://fizzy.example.com/board-id/42) and is related to [#43](https://fizzy.example.com/board-id/43)
+This fixes [#42](https://fizzy.example.com/account-id/cards/42) and is related to [#43](https://fizzy.example.com/account-id/cards/43)
 ```
 
 **Notes:**
