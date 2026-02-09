@@ -239,6 +239,7 @@ gh2fizzy --board 12345 \
 | Issue author | Card creator (when using `--identity-map`) |
 | Comment authors | Comment creators (when using `--identity-map`) |
 | Issue references (`#123`) | Converted to Fizzy card links |
+| Commit SHAs (`abc1234`) | Converted to GitHub commit links |
 
 ### Comment Format
 
@@ -275,6 +276,27 @@ This fixes [#42](https://fizzy.example.com/board-id/42) and is related to [#43](
 - Cross-repository references (`owner/repo#123`) are preserved as-is
 - References that are already part of markdown links are preserved
 - Color codes like `#123ABC` are not converted (requires word boundary after number)
+
+### Commit Reference Linking
+
+Commit SHA references in issue descriptions and comments are automatically converted to GitHub commit links:
+
+**GitHub markdown:**
+```markdown
+Fixed in abc1234 and also 1234567890abcdef1234567890abcdef12345678
+```
+
+**Converted to:**
+```markdown
+Fixed in [`abc1234`](https://github.com/owner/repo/commit/abc1234) and also [`1234567890abcdef1234567890abcdef12345678`](https://github.com/owner/repo/commit/1234567890abcdef12345678)
+```
+
+**Notes:**
+- Only 7-character (short) or 40-character (full) SHAs are converted
+- Must be lowercase hexadecimal (0-9, a-f)
+- Must be standalone (not part of a longer hex string)
+- Links point to the repository being migrated from
+- Other hex strings (8-39 chars, or with uppercase) are not converted to avoid false positives
 
 ## Exit Codes
 

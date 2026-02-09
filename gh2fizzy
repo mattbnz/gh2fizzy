@@ -440,6 +440,28 @@ convert_issue_references() {
     echo "$text" | sed -E "s@([^[]|^)#([0-9]+)([^0-9A-Za-z]|$)@\1[#\2](${fizzy_url}/\2)\3@g"
 }
 
+# Convert commit SHA references to GitHub commit links
+convert_commit_references() {
+    local text="$1"
+    local repo_slug="$2"
+
+    # Only convert if we have a repo slug
+    if [[ -z "$repo_slug" ]]; then
+        echo "$text"
+        return
+    fi
+
+    # Convert commit SHAs to GitHub links
+    # Match exactly 7 or 40 character hex strings (common GitHub SHA formats)
+    # Don't match if preceded by [ or hex char (already in markdown link or part of longer string)
+    # Don't match if followed by hex char (part of longer string)
+    # Use @ as delimiter to avoid conflicts with / in URLs
+    local github_base="https://github.com/${repo_slug}/commit"
+
+    # Use alternation to match exactly 7 OR exactly 40 hex chars
+    echo "$text" | sed -E "s@(^|[^[0-9a-f])([0-9a-f]{40}|[0-9a-f]{7})([^0-9a-f]|$)@\1[\`\2\`](${github_base}/\2)\3@g"
+}
+
 # Convert markdown to HTML (converter is required, checked in check_dependencies)
 markdown_to_html() {
     local markdown="$1"
@@ -633,6 +655,7 @@ create_fizzy_comment() {
     local created_at="$4"
     local fizzy_opts="$5"
     local raw="${6:-false}"  # If true, don't add author prefix
+    local repo_slug="${7:-}"  # Repository slug for commit links
 
     # Determine which Fizzy token to use for this comment
     local comment_token=""
@@ -668,10 +691,11 @@ create_fizzy_comment() {
         formatted_body="*Migrated from GitHub - originally by @${author}*\n\n${body}"
     fi
 
-    # Convert issue references to Fizzy card links, then markdown to HTML
+    # Convert issue references and commit references, then markdown to HTML
     local comment_file html_body body_with_links
     comment_file=$(mktemp)
     body_with_links=$(convert_issue_references "$(echo -e "$formatted_body")" "$BOARD_ID")
+    body_with_links=$(convert_commit_references "$body_with_links" "$repo_slug")
     html_body=$(markdown_to_html "$body_with_links")
     echo "$html_body" > "$comment_file"
 
@@ -760,10 +784,11 @@ create_fizzy_card() {
 <small><em>Imported from <a href=\"${github_url}\">${github_url}</a></em></small>"
     fi
 
-    # Convert issue references to Fizzy card links, then markdown to HTML
+    # Convert issue references and commit references, then markdown to HTML
     local desc_file html_body body_with_links
     desc_file=$(mktemp)
     body_with_links=$(convert_issue_references "$body_with_footer" "$BOARD_ID")
+    body_with_links=$(convert_commit_references "$body_with_links" "$repo_slug")
     html_body=$(markdown_to_html "$body_with_links")
     echo "$html_body" > "$desc_file"
 
@@ -860,7 +885,7 @@ create_fizzy_card() {
             body=$(echo "$comments_json" | jq -r ".[$k].body // \"\"")
             created_at=$(echo "$comments_json" | jq -r ".[$k].createdAt // \"\"")
 
-            if create_fizzy_comment "$card_number" "$author" "$body" "$created_at" "$fizzy_opts"; then
+            if create_fizzy_comment "$card_number" "$author" "$body" "$created_at" "$fizzy_opts" "false" "$repo_slug"; then
                 comment_success=$((comment_success + 1))
             else
                 comment_fail=$((comment_fail + 1))
@@ -903,7 +928,7 @@ create_fizzy_card() {
                 event_body=$(format_timeline_comment "$event" "$actor" "$event_time" "$commit_id" "$repo_slug" "$source_type" "$source_number" "$source_title" "$BOARD_ID")
 
                 if [[ -n "$event_body" ]]; then
-                    create_fizzy_comment "$card_number" "" "$event_body" "$event_time" "$fizzy_opts" "true" || \
+                    create_fizzy_comment "$card_number" "" "$event_body" "$event_time" "$fizzy_opts" "true" "$repo_slug" || \
                         log_warn "Failed to add timeline event comment"
                 fi
                 t=$((t + 1))
