@@ -513,7 +513,7 @@ build_gh_command() {
     cmd+=" --limit $LIMIT"
 
     # JSON output with all needed fields
-    cmd+=" --json number,title,body,comments,author,createdAt,labels,state"
+    cmd+=" --json number,title,body,comments,author,createdAt,labels,state,closedAt"
 
     echo "$cmd"
 }
@@ -533,7 +533,7 @@ fetch_issues() {
             [[ -n "$REPO" ]] && repo_flag="--repo $REPO"
 
             local issue_data
-            issue_data=$(gh issue view "$issue_num" $repo_flag --json number,title,body,comments,author,createdAt,labels,state 2>/dev/null) || true
+            issue_data=$(gh issue view "$issue_num" $repo_flag --json number,title,body,comments,author,createdAt,labels,state,closedAt 2>/dev/null) || true
 
             if [[ -n "$issue_data" ]]; then
                 [[ "$first" == "false" ]] && issues_json+=","
@@ -729,6 +729,7 @@ create_fizzy_card() {
     local expected_number="${7:-}"  # Optional: if set, verify card number matches
     local issue_state="${8:-open}"  # GitHub issue state: open or closed
     local author="${9:-unknown}"  # GitHub issue author
+    local closed_at="${10:-}"  # GitHub issue closed_at timestamp
 
     log_verbose "Creating card for issue #$issue_number: $title"
 
@@ -944,8 +945,21 @@ create_fizzy_card() {
     # Close the card if the GitHub issue was closed
     if [[ "$issue_state" == "closed" || "$issue_state" == "CLOSED" ]]; then
         log_verbose "Closing card #$card_number (GitHub issue was closed)"
-        fizzy card close "$card_number" $fizzy_opts >/dev/null 2>&1 || \
-            log_warn "Failed to close card #$card_number"
+
+        # Use the closure API to preserve GitHub's closed_at timestamp
+        if [[ -n "$FIZZY_BASE_URL" && -n "$FIZZY_ACCOUNT_ID" && -n "$card_token" ]]; then
+            local closure_timestamp="${closed_at:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}"
+            local closure_url="${FIZZY_BASE_URL}/${FIZZY_ACCOUNT_ID}/cards/${card_number}/closure"
+
+            curl -s -X POST "$closure_url" \
+                -H "Authorization: Bearer $card_token" \
+                -H "Content-Type: application/json" \
+                -d "{\"closure\": {\"closed_at\": \"$closure_timestamp\"}}" \
+                >/dev/null 2>&1 || \
+                log_warn "Failed to close card #$card_number via API"
+        else
+            log_warn "Cannot close card #$card_number - missing Fizzy base URL, account ID, or token"
+        fi
     fi
 
     # Return mismatch code after fully processing the card
@@ -1016,9 +1030,21 @@ create_placeholder_card() {
         return 1
     fi
 
-    # Close the placeholder card immediately
-    fizzy card close "$target_number" $fizzy_opts >/dev/null 2>&1 || \
-        log_warn "Failed to close placeholder card #$target_number"
+    # Close the placeholder card immediately using the closure API
+    if [[ -n "$FIZZY_BASE_URL" && -n "$FIZZY_ACCOUNT_ID" && -n "$default_token" ]]; then
+        local closure_timestamp
+        closure_timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+        local closure_url="${FIZZY_BASE_URL}/${FIZZY_ACCOUNT_ID}/cards/${target_number}/closure"
+
+        curl -s -X POST "$closure_url" \
+            -H "Authorization: Bearer $default_token" \
+            -H "Content-Type: application/json" \
+            -d "{\"closure\": {\"closed_at\": \"$closure_timestamp\"}}" \
+            >/dev/null 2>&1 || \
+            log_warn "Failed to close placeholder card #$target_number via API"
+    else
+        log_warn "Cannot close placeholder card #$target_number - missing Fizzy base URL, account ID, or token"
+    fi
 
     log_verbose "Created and closed placeholder card #$target_number in Dump board"
 }
@@ -1256,7 +1282,7 @@ main() {
         local issue
         issue=$(echo "$issues_json" | jq ".[$i]")
 
-        local number title body labels_json comments_json created_at issue_state author
+        local number title body labels_json comments_json created_at issue_state author closed_at
         number=$(echo "$issue" | jq -r '.number')
         title=$(echo "$issue" | jq -r '.title')
         body=$(echo "$issue" | jq -r '.body // ""')
@@ -1265,6 +1291,7 @@ main() {
         created_at=$(echo "$issue" | jq -r '.createdAt // ""')
         issue_state=$(echo "$issue" | jq -r '.state // "open"')
         author=$(echo "$issue" | jq -r '.author.login // "unknown"')
+        closed_at=$(echo "$issue" | jq -r '.closedAt // ""')
 
         log_info "Processing issue #$number ($((i+1))/$TOTAL_ISSUES) [${issue_state}]"
 
@@ -1296,7 +1323,7 @@ main() {
 
         local result=0
         MISMATCH_ACTUAL_NUMBER=""
-        create_fizzy_card "$title" "$body" "$labels_json" "$comments_json" "$number" "$created_at" "$expected_number" "$issue_state" "$author" || result=$?
+        create_fizzy_card "$title" "$body" "$labels_json" "$comments_json" "$number" "$created_at" "$expected_number" "$issue_state" "$author" "$closed_at" || result=$?
 
         if [[ $result -eq 0 ]]; then
             SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
