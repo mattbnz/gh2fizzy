@@ -35,11 +35,17 @@ PRESERVE_NUMBERS=false
 ISSUES_FILE=""  # Cache file for GitHub issues JSON
 DUMP_BOARD_ID=""  # Board ID for placeholder cards (auto-created if needed)
 FIZZY_BASE_URL=""  # Base URL for Fizzy instance (extracted from identity)
+IDENTITY_MAP_FILE=""  # JSON file mapping GitHub usernames to Fizzy auth tokens
+DEFAULT_ACCOUNT=""  # GitHub username from map to use as default for system comments and unmapped users
+
+# Associative array for identity mapping (loaded from file)
+declare -A IDENTITY_MAP
 
 # Counters for summary
 TOTAL_ISSUES=0
 SUCCESS_COUNT=0
 FAIL_COUNT=0
+MISMATCH_ACTUAL_NUMBER=""
 
 # Color output helpers (disabled if not a terminal)
 if [[ -t 1 ]]; then
@@ -105,6 +111,8 @@ GITHUB FILTERS:
 FIZZY OPTIONS:
     --account ACCOUNT_ID    Fizzy account ID (default: $FIZZY_ACCOUNT)
     --column COLUMN_ID      Place cards in specific column (default: triage)
+    --identity-map FILE     JSON file mapping GitHub usernames to Fizzy auth tokens
+    --default-account USER  GitHub username from map to use for unmapped users and system comments
 
 BEHAVIOR:
     --dry-run               Preview without making changes
@@ -121,6 +129,20 @@ OTHER:
     -h, --help              Show this help message
     --version               Show version
 
+IDENTITY MAPPING:
+    The --identity-map option accepts a JSON file mapping GitHub usernames to
+    Fizzy authentication tokens. When provided, cards and comments will be
+    created as the mapped Fizzy user (using --token flag). Use --default-account
+    to specify which GitHub user from the map should be used for unmapped users
+    and system comments (timeline events).
+
+    Example identity-map.json:
+    {
+      "github-user1": "fizzy_token_for_user1",
+      "github-user2": "fizzy_token_for_user2",
+      "system-bot": "fizzy_token_for_bot"
+    }
+
 EXAMPLES:
     # Migrate all open issues to a board
     gh2fizzy --board 12345
@@ -136,6 +158,9 @@ EXAMPLES:
 
     # Migrate and mark as migrated in GitHub
     gh2fizzy --board 12345 --close-issues --add-migrated-label
+
+    # Migrate with identity mapping (preserve original authors)
+    gh2fizzy --board 12345 --identity-map identity-map.json --default-account system-bot
 EOF
 }
 
@@ -219,11 +244,76 @@ parse_args() {
                 ISSUES_FILE="$2"
                 shift 2
                 ;;
+            --identity-map)
+                IDENTITY_MAP_FILE="$2"
+                shift 2
+                ;;
+            --default-account)
+                DEFAULT_ACCOUNT="$2"
+                shift 2
+                ;;
             *)
                 die "Unknown argument: $1\nRun 'gh2fizzy --help' for usage." 2
                 ;;
         esac
     done
+}
+
+load_identity_map() {
+    if [[ -z "$IDENTITY_MAP_FILE" ]]; then
+        return 0
+    fi
+
+    if [[ ! -f "$IDENTITY_MAP_FILE" ]]; then
+        die "Identity map file not found: $IDENTITY_MAP_FILE" 2
+    fi
+
+    log_verbose "Loading identity map from: $IDENTITY_MAP_FILE"
+
+    # Parse JSON file and populate associative array
+    local json_content
+    json_content=$(cat "$IDENTITY_MAP_FILE")
+
+    # Validate JSON
+    if ! echo "$json_content" | jq empty 2>/dev/null; then
+        die "Invalid JSON in identity map file: $IDENTITY_MAP_FILE" 2
+    fi
+
+    # Load mappings into associative array
+    while IFS="=" read -r github_user fizzy_token; do
+        if [[ -n "$github_user" && -n "$fizzy_token" ]]; then
+            IDENTITY_MAP["$github_user"]="$fizzy_token"
+            log_verbose "Mapped GitHub user '$github_user' -> Fizzy token (hidden)"
+        fi
+    done < <(echo "$json_content" | jq -r 'to_entries[] | "\(.key)=\(.value)"')
+
+    log_info "Loaded ${#IDENTITY_MAP[@]} identity mapping(s)"
+
+    # Validate default account exists in the map if specified
+    if [[ -n "$DEFAULT_ACCOUNT" ]]; then
+        if [[ -z "${IDENTITY_MAP[$DEFAULT_ACCOUNT]:-}" ]]; then
+            die "Default account '$DEFAULT_ACCOUNT' not found in identity map" 2
+        fi
+        log_verbose "Default account '$DEFAULT_ACCOUNT' found in identity map"
+    fi
+}
+
+get_fizzy_token_for_user() {
+    local github_username="$1"
+    local use_default="${2:-true}"  # Whether to fall back to default account
+
+    # Check if user has a mapping (skip lookup for empty username)
+    if [[ -n "$github_username" && -n "${IDENTITY_MAP[$github_username]:-}" ]]; then
+        echo "${IDENTITY_MAP[$github_username]}"
+        return 0
+    fi
+
+    # Fall back to default account's token if requested
+    if [[ "$use_default" == "true" && -n "$DEFAULT_ACCOUNT" ]]; then
+        if [[ -n "${IDENTITY_MAP[$DEFAULT_ACCOUNT]:-}" ]]; then
+            echo "${IDENTITY_MAP[$DEFAULT_ACCOUNT]}"
+        fi
+    fi
 }
 
 validate_args() {
@@ -246,6 +336,9 @@ validate_args() {
     if ! [[ "$LIMIT" =~ ^[0-9]+$ ]]; then
         die "Invalid --limit value: $LIMIT. Must be a positive integer" 2
     fi
+
+    # Load identity map if provided
+    load_identity_map
 
     log_verbose "Arguments validated"
 }
@@ -297,10 +390,23 @@ check_auth() {
 
     # Check Fizzy auth and extract base URL
     local identity_response
-    identity_response=$(fizzy identity show 2>/dev/null) || true
+    local fizzy_token=""
+
+    # If using identity mapping, use a token from the map; otherwise use global auth
+    if [[ -n "$IDENTITY_MAP_FILE" && -n "$DEFAULT_ACCOUNT" ]]; then
+        log_verbose "Using identity mapping for Fizzy authentication"
+        fizzy_token="${IDENTITY_MAP[$DEFAULT_ACCOUNT]}"
+        identity_response=$(fizzy identity show --token "$fizzy_token" 2>/dev/null) || true
+    else
+        identity_response=$(fizzy identity show 2>/dev/null) || true
+    fi
 
     if ! echo "$identity_response" | jq -e '.success == true' &>/dev/null; then
-        die "Fizzy CLI not authenticated. Run: fizzy auth login YOUR_TOKEN" 4
+        if [[ -n "$IDENTITY_MAP_FILE" ]]; then
+            die "Failed to authenticate with Fizzy using identity map token. Check your tokens are valid." 4
+        else
+            die "Fizzy CLI not authenticated. Run: fizzy auth login YOUR_TOKEN" 4
+        fi
     fi
 
     # Extract base URL from user URL in identity response
@@ -509,6 +615,26 @@ create_fizzy_comment() {
     local fizzy_opts="$5"
     local raw="${6:-false}"  # If true, don't add author prefix
 
+    # Determine which Fizzy token to use for this comment
+    local comment_token=""
+    if [[ "$raw" == "true" ]]; then
+        # System comment (timeline event) - use default token
+        comment_token=$(get_fizzy_token_for_user "" true)
+    else
+        # User comment - lookup mapped token or fall back to default
+        comment_token=$(get_fizzy_token_for_user "$author" true)
+    fi
+
+    # Build fizzy opts with the appropriate token and account
+    local comment_fizzy_opts=""
+    if [[ -n "$comment_token" ]]; then
+        comment_fizzy_opts="--token \"$comment_token\""
+    fi
+    # Always include account if specified (for workspace context)
+    if [[ -n "$FIZZY_ACCOUNT_ID" ]]; then
+        comment_fizzy_opts+=" --account $FIZZY_ACCOUNT_ID"
+    fi
+
     # Format the comment body with author attribution (unless raw mode)
     local formatted_body
     if [[ "$raw" == "true" ]]; then
@@ -524,7 +650,7 @@ create_fizzy_comment() {
     echo "$html_body" > "$comment_file"
 
     # Build the fizzy comment create command
-    local cmd="fizzy comment create --card \"$card_number\" --body_file \"$comment_file\" $fizzy_opts"
+    local cmd="fizzy comment create --card \"$card_number\" --body_file \"$comment_file\" $comment_fizzy_opts"
 
     # Add created-at timestamp if available
     if [[ -n "$created_at" && "$created_at" != "null" ]]; then
@@ -547,12 +673,23 @@ create_fizzy_card() {
     local created_at="$6"
     local expected_number="${7:-}"  # Optional: if set, verify card number matches
     local issue_state="${8:-open}"  # GitHub issue state: open or closed
+    local author="${9:-unknown}"  # GitHub issue author
 
     log_verbose "Creating card for issue #$issue_number: $title"
 
-    # Build fizzy options
+    # Determine which Fizzy token to use for this card (based on issue author)
+    local card_token
+    card_token=$(get_fizzy_token_for_user "$author" true)
+
+    # Build fizzy options with the appropriate token and account
     local fizzy_opts=""
-    [[ -n "$FIZZY_ACCOUNT_ID" ]] && fizzy_opts+=" --account $FIZZY_ACCOUNT_ID"
+    if [[ -n "$card_token" ]]; then
+        fizzy_opts="--token \"$card_token\""
+    fi
+    # Always include account if specified (for workspace context)
+    if [[ -n "$FIZZY_ACCOUNT_ID" ]]; then
+        fizzy_opts+=" --account $FIZZY_ACCOUNT_ID"
+    fi
 
     if [[ "$DRY_RUN" == "true" ]]; then
         log_info "[DRY-RUN] Would create card: $title"
@@ -650,9 +787,12 @@ create_fizzy_card() {
     fi
 
     # Verify card number matches expected (if preserve-numbers mode)
+    local number_mismatch=false
     if [[ -n "$expected_number" && "$card_number" != "$expected_number" ]]; then
-        log_error "Card number mismatch! Expected #$expected_number but got #$card_number"
-        return 2  # Special exit code for number verification failure
+        MISMATCH_ACTUAL_NUMBER="$card_number"
+        number_mismatch=true
+        log_warn "Card number mismatch: expected #$expected_number but got #$card_number"
+        log_warn "Fizzy's counter was ahead of visible max — likely deleted/hidden cards consumed numbers"
     fi
 
     log_success "Created card #$card_number for issue #$issue_number"
@@ -750,12 +890,20 @@ create_fizzy_card() {
         fizzy card close "$card_number" $fizzy_opts >/dev/null 2>&1 || \
             log_warn "Failed to close card #$card_number"
     fi
+
+    # Return mismatch code after fully processing the card
+    if [[ "$number_mismatch" == "true" ]]; then
+        return 2
+    fi
 }
 
 # Find or create the "Dump" board for placeholder cards
 get_or_create_dump_board() {
     local fizzy_opts=""
     [[ -n "$FIZZY_ACCOUNT_ID" ]] && fizzy_opts+=" --account $FIZZY_ACCOUNT_ID"
+    local default_token
+    default_token=$(get_fizzy_token_for_user "" true)
+    [[ -n "$default_token" ]] && fizzy_opts+=" --token \"$default_token\""
 
     # Look for existing Dump board
     local boards_response
@@ -788,6 +936,9 @@ create_placeholder_card() {
     local target_number="$1"
     local fizzy_opts=""
     [[ -n "$FIZZY_ACCOUNT_ID" ]] && fizzy_opts+=" --account $FIZZY_ACCOUNT_ID"
+    local default_token
+    default_token=$(get_fizzy_token_for_user "" true)
+    [[ -n "$default_token" ]] && fizzy_opts+=" --token \"$default_token\""
 
     if [[ "$DRY_RUN" == "true" ]]; then
         log_verbose "[DRY-RUN] Would create placeholder card #$target_number in Dump board"
@@ -951,6 +1102,9 @@ main() {
         log_info "Fetching existing cards from Fizzy..."
         local fizzy_opts=""
         [[ -n "$FIZZY_ACCOUNT_ID" ]] && fizzy_opts+=" --account $FIZZY_ACCOUNT_ID"
+        local default_token
+        default_token=$(get_fizzy_token_for_user "" true)
+        [[ -n "$default_token" ]] && fizzy_opts+=" --token \"$default_token\""
 
         # Find all card numbers across ALL boards (card numbers are account-wide)
         # Need to fetch both open and closed cards separately
@@ -958,7 +1112,7 @@ main() {
         local all_boards
         all_boards=$(fizzy board list $fizzy_opts 2>/dev/null) || true
         local board_ids
-        board_ids=$(echo "$all_boards" | jq -r '.data[].id // empty' 2>/dev/null)
+        board_ids=$(echo "$all_boards" | jq -r '.data[].id // empty' 2>/dev/null) || board_ids=""
 
         local all_card_numbers="[]"
         for board_id in $board_ids; do
@@ -975,7 +1129,10 @@ main() {
             closed_nums=$(echo "$closed_cards" | jq '[.data[].number // empty]' 2>/dev/null) || closed_nums="[]"
 
             # Combine with all card numbers
-            all_card_numbers=$(echo "$all_card_numbers" | jq --argjson open "$open_nums" --argjson closed "$closed_nums" '. + $open + $closed | unique')
+            all_card_numbers=$(echo "$all_card_numbers" | jq --argjson open "$open_nums" --argjson closed "$closed_nums" '. + $open + $closed | unique') || {
+                log_warn "Failed to process card numbers for board $board_id"
+                continue
+            }
 
             # Track max for this board
             local board_max
@@ -987,7 +1144,7 @@ main() {
         log_verbose "Current max card number in account: $current_max_card"
 
         local existing_numbers
-        existing_numbers=$(echo "$all_card_numbers" | jq -r '.[]' 2>/dev/null | sort -n | tr '\n' ' ')
+        existing_numbers=$(echo "$all_card_numbers" | jq -r '.[]' 2>/dev/null | sort -n | tr '\n' ' ') || existing_numbers=""
 
         if [[ -n "$existing_numbers" ]]; then
             log_verbose "Existing card numbers in account: $existing_numbers"
@@ -995,12 +1152,29 @@ main() {
             # Filter out issues whose numbers already exist as cards anywhere
             local total_before=$TOTAL_ISSUES
             issues_json=$(echo "$issues_json" | jq --argjson existing "$all_card_numbers" \
-                '[.[] | select(.number as $n | $existing | index($n) | not)]')
+                '[.[] | select(.number as $n | $existing | index($n) | not)]') || {
+                log_error "Failed to filter already-migrated issues"
+                exit 1
+            }
             TOTAL_ISSUES=$(echo "$issues_json" | jq 'length')
 
             local skipped=$((total_before - TOTAL_ISSUES))
             if [[ $skipped -gt 0 ]]; then
                 log_info "Skipped $skipped already-migrated issue(s), $TOTAL_ISSUES remaining"
+            fi
+        fi
+
+        # Filter out issues whose numbers are at or below current_max_card
+        # (these numbers are unreachable since Fizzy assigns numbers sequentially)
+        if [[ "$current_max_card" -gt 0 ]]; then
+            local reachable_before=$TOTAL_ISSUES
+            issues_json=$(echo "$issues_json" | jq --argjson max "$current_max_card" \
+                '[.[] | select(.number > $max)]')
+            TOTAL_ISSUES=$(echo "$issues_json" | jq 'length')
+
+            local unreachable=$((reachable_before - TOTAL_ISSUES))
+            if [[ $unreachable -gt 0 ]]; then
+                log_warn "Skipped $unreachable issue(s) with numbers at or below current max card #$current_max_card (unreachable)"
             fi
         fi
 
@@ -1025,7 +1199,7 @@ main() {
         local issue
         issue=$(echo "$issues_json" | jq ".[$i]")
 
-        local number title body labels_json comments_json created_at issue_state
+        local number title body labels_json comments_json created_at issue_state author
         number=$(echo "$issue" | jq -r '.number')
         title=$(echo "$issue" | jq -r '.title')
         body=$(echo "$issue" | jq -r '.body // ""')
@@ -1033,39 +1207,59 @@ main() {
         comments_json=$(echo "$issue" | jq '.comments // []')
         created_at=$(echo "$issue" | jq -r '.createdAt // ""')
         issue_state=$(echo "$issue" | jq -r '.state // "open"')
+        author=$(echo "$issue" | jq -r '.author.login // "unknown"')
 
         log_info "Processing issue #$number ($((i+1))/$TOTAL_ISSUES) [${issue_state}]"
 
         # Pass expected number if preserve-numbers mode is enabled
         local expected_number=""
         if [[ "$PRESERVE_NUMBERS" == "true" ]]; then
+            # Skip issues whose numbers are now unreachable due to counter adjustment
+            if [[ "$number" -le "$current_max_card" ]]; then
+                log_warn "Skipping issue #$number — card number already consumed (counter ahead)"
+                FAIL_COUNT=$((FAIL_COUNT + 1))
+                i=$((i + 1))
+                continue
+            fi
+
             expected_number="$number"
 
             # Fill gaps with placeholder cards if needed
             if [[ "$number" -gt $((current_max_card + 1)) ]]; then
                 local gaps_filled
-                gaps_filled=$(fill_number_gaps "$current_max_card" "$number")
-                if [[ $? -ne 0 ]]; then
+                gaps_filled=$(fill_number_gaps "$current_max_card" "$number") || {
                     log_error "Failed to fill number gaps before issue #$number"
                     FAIL_COUNT=$((FAIL_COUNT + 1))
                     print_summary
                     exit 6
-                fi
+                }
                 current_max_card=$((number - 1))
             fi
         fi
 
         local result=0
-        create_fizzy_card "$title" "$body" "$labels_json" "$comments_json" "$number" "$created_at" "$expected_number" "$issue_state" || result=$?
+        MISMATCH_ACTUAL_NUMBER=""
+        create_fizzy_card "$title" "$body" "$labels_json" "$comments_json" "$number" "$created_at" "$expected_number" "$issue_state" "$author" || result=$?
 
         if [[ $result -eq 0 ]]; then
             SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
             post_migration_github "$number"
             # Update current max card number
             [[ "$PRESERVE_NUMBERS" == "true" ]] && current_max_card="$number"
+        elif [[ $result -eq 2 && -n "$MISMATCH_ACTUAL_NUMBER" && "$MISMATCH_ACTUAL_NUMBER" -gt "$number" ]]; then
+            # Number mismatch — card was created but got a higher number than expected
+            # This means Fizzy's counter was ahead (deleted/hidden cards consumed numbers)
+            # Accept the card with the wrong number and adjust the counter so
+            # subsequent issues can still align correctly
+            local offset=$((MISMATCH_ACTUAL_NUMBER - number))
+            log_warn "Issue #$number got card #$MISMATCH_ACTUAL_NUMBER (offset: +$offset from $offset hidden/deleted card(s))"
+            log_warn "Card numbers #$((number))–#$((MISMATCH_ACTUAL_NUMBER)) are now consumed; issues in this range will be skipped"
+            SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
+            post_migration_github "$number"
+            current_max_card="$MISMATCH_ACTUAL_NUMBER"
         elif [[ $result -eq 2 ]]; then
-            # Number mismatch - abort immediately
-            log_error "Aborting migration due to card number mismatch"
+            # Number mismatch but couldn't determine actual number — abort
+            log_error "Aborting migration due to unrecoverable card number mismatch"
             FAIL_COUNT=$((FAIL_COUNT + 1))
             print_summary
             exit 6
