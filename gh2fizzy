@@ -81,7 +81,9 @@ log_error() {
 }
 
 log_verbose() {
-    [[ "$VERBOSE" == "true" ]] && echo -e "${BLUE}[DEBUG]${NC} $*" >&2
+    if [[ "$VERBOSE" == "true" ]]; then
+        echo -e "${BLUE}[DEBUG]${NC} $*" >&2
+    fi
 }
 
 die() {
