@@ -828,17 +828,24 @@ create_fizzy_card() {
     html_body=$(markdown_to_html "$body_with_links")
     echo "$html_body" > "$desc_file"
 
-    # Build the fizzy card create command
-    local cmd="fizzy card create $fizzy_opts --board \"$BOARD_ID\" --title \"$title\" --description_file \"$desc_file\""
+    # Build the fizzy card create command as an array to safely handle special characters in titles
+    local -a cmd_args=(fizzy card create)
+    if [[ -n "$card_token" ]]; then
+        cmd_args+=(--token "$card_token")
+    fi
+    if [[ -n "$FIZZY_ACCOUNT_ID" ]]; then
+        cmd_args+=(--account "$FIZZY_ACCOUNT_ID")
+    fi
+    cmd_args+=(--board "$BOARD_ID" --title "$title" --description_file "$desc_file")
 
     # Add created-at timestamp if available
     if [[ -n "$created_at" && "$created_at" != "null" ]]; then
-        cmd+=" --created-at \"$created_at\""
+        cmd_args+=(--created-at "$created_at")
     fi
 
     # Create the card
     local response
-    response=$(eval "$cmd" 2>&1) || true
+    response=$("${cmd_args[@]}" 2>&1) || true
 
     rm -f "$desc_file"
 
@@ -959,6 +966,13 @@ create_fizzy_card() {
                 source_type=$(echo "$timeline_events" | jq -r ".[$t].source_type // \"\"")
                 source_number=$(echo "$timeline_events" | jq -r ".[$t].source_number // \"\"")
                 source_title=$(echo "$timeline_events" | jq -r ".[$t].source_title // \"\"")
+
+                # Skip "closed" events when issue is closed - Fizzy adds its own "Done" entry
+                if [[ "$event" == "closed" && ("$issue_state" == "closed" || "$issue_state" == "CLOSED") ]]; then
+                    log_verbose "Skipping 'closed' event comment - Fizzy will add its own 'Done' entry"
+                    t=$((t + 1))
+                    continue
+                fi
 
                 local event_body
                 event_body=$(format_timeline_comment "$event" "$actor" "$event_time" "$commit_id" "$repo_slug" "$source_type" "$source_number" "$source_title" "$BOARD_ID")
