@@ -1500,18 +1500,54 @@ main() {
         # (these numbers are unreachable since Fizzy assigns numbers sequentially)
         if [[ "$current_max_card" -gt 0 ]]; then
             local reachable_before=$TOTAL_ISSUES
-            local issues_json_before_filter="$issues_json"
-            issues_json=$(echo "$issues_json" | jq --argjson max "$current_max_card" \
-                '[.[] | select(.number > $max)]')
-            TOTAL_ISSUES=$(echo "$issues_json" | jq 'length')
+            # Identify candidate unreachable issues (number <= max and not already filtered)
+            local candidate_numbers
+            candidate_numbers=$(echo "$issues_json" | jq -r --argjson max "$current_max_card" \
+                '[.[] | select(.number <= $max) | .number] | sort | .[]')
 
-            local unreachable=$((reachable_before - TOTAL_ISSUES))
-            if [[ $unreachable -gt 0 ]]; then
-                local unreachable_numbers
-                unreachable_numbers=$(echo "$issues_json_before_filter" | jq -r --argjson max "$current_max_card" \
-                    '[.[] | select(.number <= $max) | .number] | sort | map(tostring) | join(", ")')
-                log_warn "Skipped $unreachable issue(s) with numbers at or below current max card #$current_max_card (unreachable)"
-                log_warn "Unreachable issues: $unreachable_numbers"
+            if [[ -n "$candidate_numbers" ]]; then
+                # The card listing API may not return all cards (some cards exist
+                # but are invisible to listing endpoints). Verify each candidate
+                # individually before marking it as unreachable.
+                local verified_existing="[]"
+                local truly_unreachable=""
+                local check_count=0
+                for num in $candidate_numbers; do
+                    check_count=$((check_count + 1))
+                    local card_url="/${FIZZY_ACCOUNT_ID}/cards/${num}.json"
+                    local card_response
+                    card_response=$(fizzy_api_get "$card_url" "$default_token" 2>/dev/null) || true
+                    local card_exists
+                    card_exists=$(echo "$card_response" | jq -e '.number' 2>/dev/null) || true
+                    if [[ -n "$card_exists" && "$card_exists" != "null" ]]; then
+                        log_verbose "Card #$num exists (verified individually) — already migrated"
+                        verified_existing=$(echo "$verified_existing" | jq --argjson n "$num" '. + [$n]')
+                    else
+                        truly_unreachable="${truly_unreachable:+$truly_unreachable, }$num"
+                    fi
+                done
+                log_verbose "Verified $check_count card(s) individually: $(echo "$verified_existing" | jq 'length') exist, rest unreachable"
+
+                # Filter out verified-existing cards (they're already migrated)
+                local verified_count
+                verified_count=$(echo "$verified_existing" | jq 'length')
+                if [[ "$verified_count" -gt 0 ]]; then
+                    issues_json=$(echo "$issues_json" | jq --argjson existing "$verified_existing" \
+                        '[.[] | select(.number as $n | $existing | index($n) | not)]')
+                    TOTAL_ISSUES=$(echo "$issues_json" | jq 'length')
+                    log_info "Skipped $verified_count additional already-migrated issue(s) found via individual card checks"
+                fi
+
+                # Now filter truly unreachable (number <= max AND card doesn't exist)
+                if [[ -n "$truly_unreachable" ]]; then
+                    issues_json=$(echo "$issues_json" | jq --argjson max "$current_max_card" \
+                        '[.[] | select(.number > $max)]')
+                    TOTAL_ISSUES=$(echo "$issues_json" | jq 'length')
+                    local unreachable_count
+                    unreachable_count=$(echo "$truly_unreachable" | tr ',' '\n' | wc -w)
+                    log_warn "Skipped $unreachable_count issue(s) with numbers at or below max card #$current_max_card (truly unreachable — no card exists)"
+                    log_warn "Unreachable issues: $truly_unreachable"
+                fi
             fi
         fi
 
