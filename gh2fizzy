@@ -96,10 +96,13 @@ show_help() {
 gh2fizzy - Migrate GitHub Issues to Fizzy Cards
 
 USAGE:
-    gh2fizzy --board BOARD_ID [OPTIONS]
+    gh2fizzy --board BOARD_ID --identity-map FILE --default-account USER [OPTIONS]
 
 REQUIRED:
     --board BOARD_ID        Fizzy board ID to create cards in
+    --identity-map FILE     JSON file mapping GitHub usernames to Fizzy auth tokens
+    --default-account USER  GitHub username from map to use as default for
+                            unmapped users and system comments
 
 GITHUB FILTERS:
     -R, --repo OWNER/REPO   GitHub repository (default: current repo)
@@ -113,8 +116,6 @@ GITHUB FILTERS:
 FIZZY OPTIONS:
     --account ACCOUNT_ID    Fizzy account ID (default: $FIZZY_ACCOUNT)
     --column COLUMN_ID      Place cards in specific column (default: triage)
-    --identity-map FILE     JSON file mapping GitHub usernames to Fizzy auth tokens
-    --default-account USER  GitHub username from map to use for unmapped users and system comments
 
 BEHAVIOR:
     --dry-run               Preview without making changes
@@ -132,11 +133,13 @@ OTHER:
     --version               Show version
 
 IDENTITY MAPPING:
-    The --identity-map option accepts a JSON file mapping GitHub usernames to
-    Fizzy authentication tokens. When provided, cards and comments will be
-    created as the mapped Fizzy user (using --token flag). Use --default-account
-    to specify which GitHub user from the map should be used for unmapped users
-    and system comments (timeline events).
+    The --identity-map file maps GitHub usernames to Fizzy API access tokens.
+    Cards and comments will be created as the mapped Fizzy user via the API.
+    The --default-account specifies which GitHub user from the map should be
+    used for unmapped users and system comments (timeline events).
+
+    Requires api_url and account to be configured in .fizzy.yaml, or provided
+    via --account flag.
 
     Example identity-map.json:
     {
@@ -147,22 +150,19 @@ IDENTITY MAPPING:
 
 EXAMPLES:
     # Migrate all open issues to a board
-    gh2fizzy --board 12345
+    gh2fizzy --board 12345 --identity-map map.json --default-account bot
 
     # Migrate specific issues
-    gh2fizzy --board 12345 -i 42 -i 43
+    gh2fizzy --board 12345 --identity-map map.json --default-account bot -i 42 -i 43
 
     # Migrate from specific repo with filters
-    gh2fizzy -R owner/repo -l bug --state open --board 12345
+    gh2fizzy -R owner/repo -l bug --state open --board 12345 --identity-map map.json --default-account bot
 
     # Preview what would be migrated
-    gh2fizzy --board 12345 --dry-run
+    gh2fizzy --board 12345 --identity-map map.json --default-account bot --dry-run
 
     # Migrate and mark as migrated in GitHub
-    gh2fizzy --board 12345 --close-issues --add-migrated-label
-
-    # Migrate with identity mapping (preserve original authors)
-    gh2fizzy --board 12345 --identity-map identity-map.json --default-account system-bot
+    gh2fizzy --board 12345 --identity-map map.json --default-account bot --close-issues --add-migrated-label
 EOF
 }
 
@@ -318,9 +318,168 @@ get_fizzy_token_for_user() {
     fi
 }
 
+# --- Fizzy HTTP API helpers ---
+
+# Build full Fizzy API URL from a path
+fizzy_api_url() {
+    local path="$1"
+    echo "${FIZZY_BASE_URL}${path}"
+}
+
+# GET request to Fizzy API, returns response body
+fizzy_api_get() {
+    local path="$1"
+    local token="$2"
+    local url
+    url=$(fizzy_api_url "$path")
+
+    log_verbose "API GET $path"
+    curl -s -H "Authorization: Bearer $token" -H "Accept: application/json" "$url"
+}
+
+# POST request to Fizzy API
+# Outputs: body lines, then http_status, then location_header (last two lines)
+# Uses temp files to avoid ARG_MAX limits and set -e / subshell stdout issues.
+fizzy_api_post() {
+    local path="$1"
+    local json_data="$2"
+    local token="$3"
+    local url
+    url=$(fizzy_api_url "$path")
+
+    log_verbose "API POST $path"
+    local header_file body_file response_file
+    header_file=$(mktemp)
+    body_file=$(mktemp)
+    response_file=$(mktemp)
+
+    # Write JSON payload to a temp file so curl reads it with -d @file,
+    # avoiding "Argument list too long" for large payloads (e.g. card descriptions).
+    printf '%s' "$json_data" > "$body_file"
+
+    # Capture curl output to a temp file. Use -w to append HTTP status code
+    # on its own line (separated by newline).
+    local curl_exit=0
+    curl -s -w '\n%{http_code}' \
+        -D "$header_file" \
+        -X POST \
+        -H "Authorization: Bearer $token" \
+        -H "Content-Type: application/json" \
+        -H "Accept: application/json" \
+        -d "@$body_file" \
+        "$url" > "$response_file" 2>&1 || curl_exit=$?
+
+    rm -f "$body_file"
+
+    if [[ $curl_exit -ne 0 ]]; then
+        log_verbose "curl POST exited with code $curl_exit"
+    fi
+
+    # Extract HTTP status code (last line of response file, from -w format)
+    local http_status_code
+    http_status_code=$(tail -1 "$response_file")
+
+    # Response body is everything except the last line (the status code)
+    local response_body
+    response_body=$(sed '$d' "$response_file")
+    rm -f "$response_file"
+
+    # Extract Location header
+    local location=""
+    if [[ -s "$header_file" ]]; then
+        location=$(grep -i '^location:' "$header_file" | sed 's/^[Ll]ocation:[[:space:]]*//' | tr -d '\r' | head -1) || true
+    fi
+    rm -f "$header_file"
+
+    # Output exactly 3 lines: body (may be empty), status code, location
+    echo "$response_body"
+    echo "$http_status_code"
+    echo "$location"
+}
+
+# Paginated GET - follows pages until empty array, returns merged JSON array
+# Uses a temp file to accumulate results, avoiding ARG_MAX limits on large datasets.
+fizzy_api_get_all_pages() {
+    local path="$1"
+    local token="$2"
+    local page=1
+    local max_pages=500
+    local separator="?"
+    # If path already contains ?, use & for additional params
+    if [[ "$path" == *"?"* ]]; then
+        separator="&"
+    fi
+
+    # Accumulate results in a temp file to avoid "Argument list too long" errors
+    # when the merged JSON array grows beyond ARG_MAX (~2MB).
+    local accum_file
+    accum_file=$(mktemp)
+    printf '[]' > "$accum_file"
+
+    while [[ $page -le $max_pages ]]; do
+        local page_path="${path}${separator}page=${page}"
+        log_verbose "Fetching page $page: $page_path"
+
+        local page_file
+        page_file=$(mktemp)
+        fizzy_api_get "$page_path" "$token" > "$page_file" || {
+            log_verbose "Page $page: request failed, stopping pagination"
+            rm -f "$page_file"
+            break
+        }
+
+        local page_length
+        page_length=$(jq 'length' "$page_file" 2>/dev/null) || {
+            log_verbose "Page $page: failed to parse response length, stopping pagination"
+            log_verbose "Page $page response: $(head -c 200 "$page_file")"
+            rm -f "$page_file"
+            break
+        }
+
+        log_verbose "Page $page: $page_length item(s)"
+
+        if [[ "$page_length" -eq 0 ]]; then
+            log_verbose "Page $page: empty, stopping pagination"
+            rm -f "$page_file"
+            break
+        fi
+
+        # Merge page into accumulator using file-based jq (no shell variable passing)
+        jq -s '.[0] + .[1]' "$accum_file" "$page_file" > "${accum_file}.tmp" && \
+            mv "${accum_file}.tmp" "$accum_file" || {
+            log_verbose "Page $page: failed to merge results, stopping pagination"
+            rm -f "$page_file" "${accum_file}.tmp"
+            break
+        }
+        rm -f "$page_file"
+        page=$((page + 1))
+    done
+
+    if [[ $page -gt $max_pages ]]; then
+        log_warn "Hit max page limit ($max_pages) during pagination"
+    fi
+
+    local total
+    total=$(jq 'length' "$accum_file" 2>/dev/null) || total="?"
+    log_verbose "Fetched $total item(s) across $((page - 1)) page(s)"
+
+    cat "$accum_file"
+    rm -f "$accum_file"
+}
+
+# --- End Fizzy HTTP API helpers ---
+
 validate_args() {
     if [[ -z "$BOARD_ID" ]]; then
         die "Missing required argument: --board BOARD_ID\nRun 'gh2fizzy --help' for usage." 2
+    fi
+
+    # Require --identity-map and --default-account (no fizzy CLI fallback)
+    if [[ -z "$IDENTITY_MAP_FILE" ]]; then
+        die "Missing required argument: --identity-map FILE\nA Fizzy identity map is required for API authentication.\nRun 'gh2fizzy --help' for usage." 2
+    fi
+    if [[ -z "$DEFAULT_ACCOUNT" ]]; then
+        die "Missing required argument: --default-account USER\nA default account is required for API authentication.\nRun 'gh2fizzy --help' for usage." 2
     fi
 
     # Load account ID from .fizzy.yaml if not provided via --account
@@ -377,10 +536,6 @@ check_dependencies() {
         missing+=("gh (GitHub CLI)")
     fi
 
-    if ! command -v fizzy &>/dev/null; then
-        missing+=("fizzy (Fizzy CLI)")
-    fi
-
     if ! command -v jq &>/dev/null; then
         missing+=("jq (JSON processor)")
     fi
@@ -413,71 +568,70 @@ check_auth() {
         die "GitHub CLI not authenticated. Run: gh auth login" 4
     fi
 
-    # Check Fizzy auth and extract base URL
-    local identity_response
-    local fizzy_token=""
+    # Check Fizzy auth via API and extract base URL
+    local fizzy_token="${IDENTITY_MAP[$DEFAULT_ACCOUNT]}"
 
-    # If using identity mapping, use a token from the map; otherwise use global auth
-    if [[ -n "$IDENTITY_MAP_FILE" && -n "$DEFAULT_ACCOUNT" ]]; then
-        log_verbose "Using identity mapping for Fizzy authentication"
-        fizzy_token="${IDENTITY_MAP[$DEFAULT_ACCOUNT]}"
-        identity_response=$(fizzy identity show --token "$fizzy_token" 2>/dev/null) || true
-    else
-        identity_response=$(fizzy identity show 2>/dev/null) || true
-    fi
-
-    if ! echo "$identity_response" | jq -e '.success == true' &>/dev/null; then
-        if [[ -n "$IDENTITY_MAP_FILE" ]]; then
-            die "Failed to authenticate with Fizzy using identity map token. Check your tokens are valid." 4
-        else
-            die "Fizzy CLI not authenticated. Run: fizzy auth login YOUR_TOKEN" 4
-        fi
-    fi
-
-    # Extract base URL from user URL in identity response (if not already set from .fizzy.yaml)
+    # We need FIZZY_BASE_URL to make the API call - it must come from .fizzy.yaml
     if [[ -z "$FIZZY_BASE_URL" ]]; then
-        local user_url
-        user_url=$(echo "$identity_response" | jq -r '.data.accounts[0].user.url // empty' 2>/dev/null)
-        if [[ -n "$user_url" ]]; then
-            # Extract base URL by removing the /users/... path
-            FIZZY_BASE_URL=$(echo "$user_url" | sed 's|/users/.*||')
-            log_verbose "Fizzy base URL from identity: $FIZZY_BASE_URL"
-        else
-            log_warn "Could not extract Fizzy base URL from identity response"
-            log_verbose "Identity response: $identity_response"
-        fi
-    else
-        log_verbose "Using Fizzy base URL from config: $FIZZY_BASE_URL"
+        die "Fizzy base URL not configured. Set api_url in .fizzy.yaml or ensure it is set before check_auth." 4
+    fi
+
+    log_verbose "Using identity mapping for Fizzy authentication"
+    local identity_response
+    identity_response=$(fizzy_api_get "/my/identity" "$fizzy_token") || true
+
+    if ! echo "$identity_response" | jq -e '.accounts' &>/dev/null; then
+        die "Failed to authenticate with Fizzy using identity map token. Check your tokens are valid." 4
+    fi
+
+    # Extract base URL from user URL in identity response (update if not already set from config)
+    local user_url
+    user_url=$(echo "$identity_response" | jq -r '.accounts[0].user.url // empty' 2>/dev/null)
+    if [[ -n "$user_url" ]]; then
+        local identity_base_url
+        identity_base_url=$(echo "$user_url" | sed 's|/users/.*||')
+        log_verbose "Fizzy base URL from identity: $identity_base_url"
     fi
 
     log_verbose "Authentication verified"
 }
 
-# Fetch all card numbers from a paginated fizzy card list command
-# Usage: fetch_all_card_numbers_paginated [fizzy card list args...]
+# Fetch all card numbers from a paginated Fizzy API card list
+# Usage: fetch_all_card_numbers_paginated PATH TOKEN
+# Note: The card "number" JSON field is board-local. The account-wide card
+# number lives in the card URL (e.g. .../cards/42). We extract from the URL.
 fetch_all_card_numbers_paginated() {
-    local all_nums="[]"
-    local page=1
+    local path="$1"
+    local token="$2"
 
-    while true; do
-        local response
-        response=$(eval "fizzy card list $* --page $page" 2>/dev/null) || break
+    # Write paginated results directly to a temp file to avoid ARG_MAX limits
+    local tmpfile
+    tmpfile=$(mktemp)
+    fizzy_api_get_all_pages "$path" "$token" > "$tmpfile"
 
-        local page_nums
-        page_nums=$(echo "$response" | jq '[.data[].number // empty]' 2>/dev/null) || break
+    # Debug: show a sample card's url and number fields
+    log_verbose "Sample card: $(jq -c '.[0] | {url, number}' "$tmpfile" 2>/dev/null)"
 
-        local page_count
-        page_count=$(echo "$page_nums" | jq 'length' 2>/dev/null) || break
+    # Extract account-wide card number from each card's url field
+    # URL format: http://host/account_slug/cards/NUMBER
+    local nums_file nums
+    nums_file=$(mktemp)
+    jq -r '.[].url // empty' "$tmpfile" | grep -oE '/cards/[0-9]+$' | grep -oE '[0-9]+$' | jq -Rs 'split("\n") | map(select(length > 0) | tonumber)' > "$nums_file" 2>/dev/null
 
-        if [[ "$page_count" -eq 0 ]]; then
-            break
-        fi
+    nums=$(cat "$nums_file")
+    if [[ -z "$nums" || "$nums" == "null" || "$nums" == "[]" ]]; then
+        log_verbose "URL extraction returned empty, trying .number field"
+        nums=$(jq '[.[].number // empty]' "$tmpfile" 2>/dev/null)
+    fi
 
-        all_nums=$(echo "$all_nums" | jq --argjson new "$page_nums" '. + $new') || break
-        page=$((page + 1))
-    done
+    rm -f "$tmpfile" "$nums_file"
 
-    echo "$all_nums"
+    local count max_num
+    count=$(echo "${nums:-[]}" | jq 'length' 2>/dev/null) || count=0
+    max_num=$(echo "${nums:-[]}" | jq 'max // 0' 2>/dev/null) || max_num=0
+    log_verbose "Extracted $count card number(s), max: $max_num"
+
+    echo "${nums:-[]}"
 }
 
 # Convert GitHub issue references (#123) to Fizzy card links
@@ -751,28 +905,16 @@ create_fizzy_comment() {
     local author="$2"
     local body="$3"
     local created_at="$4"
-    local fizzy_opts="$5"
+    local _fizzy_opts="$5"  # Unused, kept for call-site compatibility
     local raw="${6:-false}"  # If true, don't add author prefix
     local repo_slug="${7:-}"  # Repository slug for commit links
 
     # Determine which Fizzy token to use for this comment
     local comment_token=""
     if [[ "$raw" == "true" ]]; then
-        # System comment (timeline event) - use default token
         comment_token=$(get_fizzy_token_for_user "" true)
     else
-        # User comment - lookup mapped token or fall back to default
         comment_token=$(get_fizzy_token_for_user "$author" true)
-    fi
-
-    # Build fizzy opts with the appropriate token and account
-    local comment_fizzy_opts=""
-    if [[ -n "$comment_token" ]]; then
-        comment_fizzy_opts="--token \"$comment_token\""
-    fi
-    # Always include account if specified (for workspace context)
-    if [[ -n "$FIZZY_ACCOUNT_ID" ]]; then
-        comment_fizzy_opts+=" --account $FIZZY_ACCOUNT_ID"
     fi
 
     # Format the comment body with author attribution
@@ -791,28 +933,34 @@ create_fizzy_comment() {
 
     # Convert issue references and commit references, then markdown to HTML
     # Skip commit conversion for timeline events (raw=true) since they already have formatted links
-    local comment_file html_body body_with_links
-    comment_file=$(mktemp)
+    local html_body body_with_links
     body_with_links=$(convert_issue_references "$(echo -e "$formatted_body")" "$BOARD_ID")
     if [[ "$raw" != "true" ]]; then
         body_with_links=$(convert_commit_references "$body_with_links" "$repo_slug")
     fi
     html_body=$(markdown_to_html "$body_with_links")
-    echo "$html_body" > "$comment_file"
 
-    # Build the fizzy comment create command
-    local cmd="fizzy comment create --card \"$card_number\" --body_file \"$comment_file\" $comment_fizzy_opts"
-
-    # Add created-at timestamp if available
+    # Build JSON payload using jq for safe encoding
+    local json_payload
+    json_payload=$(jq -n --arg body "$html_body" '{"comment": {"body": $body}}')
     if [[ -n "$created_at" && "$created_at" != "null" ]]; then
-        cmd+=" --created-at \"$created_at\""
+        json_payload=$(echo "$json_payload" | jq --arg ts "$created_at" '.comment.created_at = $ts')
     fi
 
-    eval "$cmd" >/dev/null 2>&1
-    local result=$?
+    local api_path="/${FIZZY_ACCOUNT_ID}/cards/${card_number}/comments"
+    local response
+    response=$(fizzy_api_post "$api_path" "$json_payload" "$comment_token") || return 1
 
-    rm -f "$comment_file"
-    return $result
+    # Parse response: last two lines are status code and Location header
+    local http_status
+    http_status=$(echo "$response" | tail -2 | head -1)
+
+    if [[ "$http_status" == "201" ]]; then
+        return 0
+    else
+        log_verbose "Comment creation failed with HTTP $http_status"
+        return 1
+    fi
 }
 
 create_fizzy_card() {
@@ -833,16 +981,6 @@ create_fizzy_card() {
     # Determine which Fizzy token to use for this card (based on issue author)
     local card_token
     card_token=$(get_fizzy_token_for_user "$author" true)
-
-    # Build fizzy options with the appropriate token and account
-    local fizzy_opts=""
-    if [[ -n "$card_token" ]]; then
-        fizzy_opts="--token \"$card_token\""
-    fi
-    # Always include account if specified (for workspace context)
-    if [[ -n "$FIZZY_ACCOUNT_ID" ]]; then
-        fizzy_opts+=" --account $FIZZY_ACCOUNT_ID"
-    fi
 
     if [[ "$DRY_RUN" == "true" ]]; then
         log_info "[DRY-RUN] Would create card: $title"
@@ -916,63 +1054,47 @@ create_fizzy_card() {
     fi
 
     # Convert issue references and commit references, then markdown to HTML
-    local desc_file html_body body_with_links
-    desc_file=$(mktemp)
+    local html_body body_with_links
     body_with_links=$(convert_issue_references "$body_with_footer" "$BOARD_ID")
     body_with_links=$(convert_commit_references "$body_with_links" "$repo_slug")
     html_body=$(markdown_to_html "$body_with_links")
-    echo "$html_body" > "$desc_file"
 
-    # Build the fizzy card create command as an array to safely handle special characters in titles
-    local -a cmd_args=(fizzy card create)
-    if [[ -n "$card_token" ]]; then
-        cmd_args+=(--token "$card_token")
-    fi
-    if [[ -n "$FIZZY_ACCOUNT_ID" ]]; then
-        cmd_args+=(--account "$FIZZY_ACCOUNT_ID")
-    fi
-    cmd_args+=(--board "$BOARD_ID" --title "$title" --description_file "$desc_file")
-
-    # Add created-at timestamp if available
+    # Build JSON payload using jq for safe encoding
+    local json_payload
+    json_payload=$(jq -n --arg title "$title" --arg desc "$html_body" \
+        '{"card": {"title": $title, "description": $desc}}')
     if [[ -n "$created_at" && "$created_at" != "null" ]]; then
-        cmd_args+=(--created-at "$created_at")
+        json_payload=$(echo "$json_payload" | jq --arg ts "$created_at" '.card.created_at = $ts')
     fi
 
-    # Create the card
+    # Create the card via API
+    local api_path="/${FIZZY_ACCOUNT_ID}/boards/${BOARD_ID}/cards"
     local response
-    response=$("${cmd_args[@]}" 2>&1) || true
+    response=$(fizzy_api_post "$api_path" "$json_payload" "$card_token") || true
 
-    rm -f "$desc_file"
+    # Parse response: body is everything except the last two lines (status + Location)
+    local http_status location_header card_number
+    http_status=$(echo "$response" | tail -2 | head -1)
+    location_header=$(echo "$response" | tail -1)
 
-    # Parse response
-    local success card_number
-    success=$(echo "$response" | jq -r '.success // false' 2>/dev/null) || success="false"
-
-    if [[ "$success" != "true" ]]; then
-        local error_msg
-        error_msg=$(echo "$response" | jq -r '.error.message // "Unknown error"' 2>/dev/null) || error_msg="$response"
-        log_error "Failed to create card for issue #$issue_number: $error_msg"
+    if [[ "$http_status" != "201" ]]; then
+        local response_body
+        response_body=$(echo "$response" | sed '$d' | sed '$d')
+        log_error "Failed to create card for issue #$issue_number: HTTP $http_status"
+        log_verbose "Response: $response_body"
         return 1
     fi
 
-    # Try to get card number from response, or fetch most recent card
-    card_number=$(echo "$response" | jq -r '.data.number // empty' 2>/dev/null)
+    # Extract card number from Location header: /ACCOUNT/cards/NUMBER.json
+    card_number=$(echo "$location_header" | sed -E 's|.*/cards/([0-9]+)\.json$|\1|')
 
-    if [[ -z "$card_number" || "$card_number" == "null" ]]; then
-        # fizzy card create doesn't return card data, fetch most recent card by title match
-        log_verbose "Fetching card number for newly created card..."
-        local cards_response
-        cards_response=$(fizzy card list --board "$BOARD_ID" --all --sort newest $fizzy_opts 2>/dev/null) || true
-        card_number=$(echo "$cards_response" | jq -r --arg title "$title" '.data[] | select(.title == $title) | .number' 2>/dev/null | head -1)
-    fi
-
-    if [[ -z "$card_number" || "$card_number" == "null" ]]; then
+    if [[ -z "$card_number" || ! "$card_number" =~ ^[0-9]+$ ]]; then
         if [[ -n "$expected_number" ]]; then
-            log_error "Cannot verify card number for issue #$issue_number - card number unavailable"
-            return 2  # Special exit code for number verification failure
+            log_error "Cannot verify card number for issue #$issue_number - card number unavailable from Location: $location_header"
+            return 2
         fi
         log_success "Created card for issue #$issue_number (card number unavailable)"
-        log_warn "Unable to retrieve card number - skipping tags and comments"
+        log_warn "Unable to parse card number from Location header - skipping tags and comments"
         return 0
     fi
 
@@ -990,7 +1112,9 @@ create_fizzy_card() {
     # Move to column if specified
     if [[ -n "$COLUMN_ID" ]]; then
         log_verbose "Moving card #$card_number to column $COLUMN_ID"
-        fizzy card column "$card_number" --column "$COLUMN_ID" $fizzy_opts >/dev/null 2>&1 || \
+        local triage_payload
+        triage_payload=$(jq -n --arg col "$COLUMN_ID" '{"column_id": $col}')
+        fizzy_api_post "/${FIZZY_ACCOUNT_ID}/cards/${card_number}/triage" "$triage_payload" "$card_token" >/dev/null 2>&1 || \
             log_warn "Failed to move card to column"
     fi
 
@@ -1001,9 +1125,10 @@ create_fizzy_card() {
         log_verbose "Applying $label_count tag(s) from labels..."
         local j=0
         while [[ $j -lt $label_count ]]; do
-            local label_name
+            local label_name tag_payload
             label_name=$(echo "$labels_json" | jq -r ".[$j].name")
-            fizzy card tag "$card_number" --tag "$label_name" $fizzy_opts >/dev/null 2>&1 || \
+            tag_payload=$(jq -n --arg tag "$label_name" '{"tag_title": $tag}')
+            fizzy_api_post "/${FIZZY_ACCOUNT_ID}/cards/${card_number}/taggings" "$tag_payload" "$card_token" >/dev/null 2>&1 || \
                 log_warn "Failed to apply tag: $label_name"
             j=$((j + 1))
         done
@@ -1023,7 +1148,7 @@ create_fizzy_card() {
             body=$(echo "$comments_json" | jq -r ".[$k].body // \"\"")
             created_at=$(echo "$comments_json" | jq -r ".[$k].createdAt // \"\"")
 
-            if create_fizzy_comment "$card_number" "$author" "$body" "$created_at" "$fizzy_opts" "false" "$repo_slug"; then
+            if create_fizzy_comment "$card_number" "$author" "$body" "$created_at" "" "false" "$repo_slug"; then
                 comment_success=$((comment_success + 1))
             else
                 comment_fail=$((comment_fail + 1))
@@ -1073,7 +1198,7 @@ create_fizzy_card() {
                 event_body=$(format_timeline_comment "$event" "$actor" "$event_time" "$commit_id" "$repo_slug" "$source_type" "$source_number" "$source_title" "$BOARD_ID")
 
                 if [[ -n "$event_body" ]]; then
-                    create_fizzy_comment "$card_number" "" "$event_body" "$event_time" "$fizzy_opts" "true" "$repo_slug" || \
+                    create_fizzy_comment "$card_number" "" "$event_body" "$event_time" "" "true" "$repo_slug" || \
                         log_warn "Failed to add timeline event comment"
                 fi
                 t=$((t + 1))
@@ -1084,27 +1209,11 @@ create_fizzy_card() {
     # Close the card if the GitHub issue was closed
     if [[ "$issue_state" == "closed" || "$issue_state" == "CLOSED" ]]; then
         log_verbose "Closing card #$card_number (GitHub issue was closed)"
-
-        # Use the closure API to preserve GitHub's closed_at timestamp
-        if [[ -n "$FIZZY_BASE_URL" && -n "$FIZZY_ACCOUNT_ID" && -n "$card_token" ]]; then
-            local closure_timestamp="${closed_at:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}"
-            local closure_url="${FIZZY_BASE_URL}/${FIZZY_ACCOUNT_ID}/cards/${card_number}/closure"
-
-            curl -s -X POST "$closure_url" \
-                -H "Authorization: Bearer $card_token" \
-                -H "Content-Type: application/json" \
-                -H "Sec-Fetch-Site: same-origin" \
-                -H "Sec-Fetch-Mode: cors" \
-                -H "Sec-Fetch-Dest: empty" \
-                -d "{\"closure\": {\"closed_at\": \"$closure_timestamp\"}}" \
-                >/dev/null 2>&1 || \
-                log_warn "Failed to close card #$card_number"
-        else
-            log_warn "Cannot close card #$card_number - missing required config:"
-            [[ -z "$FIZZY_BASE_URL" ]] && log_warn "  - FIZZY_BASE_URL is empty"
-            [[ -z "$FIZZY_ACCOUNT_ID" ]] && log_warn "  - FIZZY_ACCOUNT_ID is empty (use --account)"
-            [[ -z "$card_token" ]] && log_warn "  - card_token is empty"
-        fi
+        local closure_timestamp="${closed_at:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}"
+        local closure_payload
+        closure_payload=$(jq -n --arg ts "$closure_timestamp" '{"closure": {"closed_at": $ts}}')
+        fizzy_api_post "/${FIZZY_ACCOUNT_ID}/cards/${card_number}/closure" "$closure_payload" "$card_token" >/dev/null 2>&1 || \
+            log_warn "Failed to close card #$card_number"
     fi
 
     # Return mismatch code after fully processing the card
@@ -1115,17 +1224,14 @@ create_fizzy_card() {
 
 # Find or create the "Dump" board for placeholder cards
 get_or_create_dump_board() {
-    local fizzy_opts=""
-    [[ -n "$FIZZY_ACCOUNT_ID" ]] && fizzy_opts+=" --account $FIZZY_ACCOUNT_ID"
     local default_token
     default_token=$(get_fizzy_token_for_user "" true)
-    [[ -n "$default_token" ]] && fizzy_opts+=" --token \"$default_token\""
 
-    # Look for existing Dump board
+    # Look for existing Dump board (paginated — board list is paginated per API docs)
     local boards_response
-    boards_response=$(fizzy board list $fizzy_opts 2>/dev/null) || true
+    boards_response=$(fizzy_api_get_all_pages "/${FIZZY_ACCOUNT_ID}/boards" "$default_token") || true
 
-    DUMP_BOARD_ID=$(echo "$boards_response" | jq -r '.data[] | select(.name == "Dump") | .id' 2>/dev/null | head -1)
+    DUMP_BOARD_ID=$(echo "$boards_response" | jq -r '.[] | select(.name == "Dump") | .id' 2>/dev/null | head -1)
 
     if [[ -n "$DUMP_BOARD_ID" && "$DUMP_BOARD_ID" != "null" ]]; then
         log_verbose "Found existing Dump board: $DUMP_BOARD_ID"
@@ -1135,9 +1241,12 @@ get_or_create_dump_board() {
     # Create the Dump board
     log_info "Creating Dump board for placeholder cards..."
     local create_response
-    create_response=$(fizzy board create --name "Dump" $fizzy_opts 2>&1) || true
+    create_response=$(fizzy_api_post "/${FIZZY_ACCOUNT_ID}/boards" '{"board":{"name":"Dump"}}' "$default_token") || true
 
-    DUMP_BOARD_ID=$(echo "$create_response" | jq -r '.data.id // empty' 2>/dev/null)
+    # Extract board ID from Location header: /ACCOUNT/boards/ID.json
+    local location_header
+    location_header=$(echo "$create_response" | tail -1)
+    DUMP_BOARD_ID=$(echo "$location_header" | sed -E 's|.*/boards/([^/.]+)\.json$|\1|')
 
     if [[ -z "$DUMP_BOARD_ID" || "$DUMP_BOARD_ID" == "null" ]]; then
         log_error "Failed to create Dump board"
@@ -1150,54 +1259,50 @@ get_or_create_dump_board() {
 # Create a placeholder card in the Dump board to consume a card number
 create_placeholder_card() {
     local target_number="$1"
-    local fizzy_opts=""
-    [[ -n "$FIZZY_ACCOUNT_ID" ]] && fizzy_opts+=" --account $FIZZY_ACCOUNT_ID"
     local default_token
     default_token=$(get_fizzy_token_for_user "" true)
-    [[ -n "$default_token" ]] && fizzy_opts+=" --token \"$default_token\""
 
     if [[ "$DRY_RUN" == "true" ]]; then
         log_verbose "[DRY-RUN] Would create placeholder card #$target_number in Dump board"
         return 0
     fi
 
+    local json_payload
+    json_payload=$(jq -n --arg title "Placeholder #$target_number (PR or deleted issue)" \
+        '{"card": {"title": $title}}')
+
     local response
-    response=$(fizzy card create \
-        $fizzy_opts \
-        --board "$DUMP_BOARD_ID" \
-        --title "Placeholder #$target_number (PR or deleted issue)" 2>&1) || true
+    response=$(fizzy_api_post "/${FIZZY_ACCOUNT_ID}/boards/${DUMP_BOARD_ID}/cards" "$json_payload" "$default_token") || true
 
-    local success
-    success=$(echo "$response" | jq -r '.success // false' 2>/dev/null) || success="false"
+    local http_status
+    http_status=$(echo "$response" | tail -2 | head -1)
 
-    if [[ "$success" != "true" ]]; then
-        log_error "Failed to create placeholder card"
+    if [[ "$http_status" != "201" ]]; then
+        local response_body
+        response_body=$(echo "$response" | sed '$d' | sed '$d')
+        log_error "Failed to create placeholder card (HTTP $http_status)"
+        log_verbose "Response: $response_body"
         return 1
     fi
 
-    # Close the placeholder card immediately using the closure API
-    if [[ -n "$FIZZY_BASE_URL" && -n "$FIZZY_ACCOUNT_ID" && -n "$default_token" ]]; then
-        local closure_timestamp
-        closure_timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-        local closure_url="${FIZZY_BASE_URL}/${FIZZY_ACCOUNT_ID}/cards/${target_number}/closure"
-
-        curl -s -X POST "$closure_url" \
-            -H "Authorization: Bearer $default_token" \
-            -H "Content-Type: application/json" \
-            -H "Sec-Fetch-Site: same-origin" \
-            -H "Sec-Fetch-Mode: cors" \
-            -H "Sec-Fetch-Dest: empty" \
-            -d "{\"closure\": {\"closed_at\": \"$closure_timestamp\"}}" \
-            >/dev/null 2>&1 || \
-            log_warn "Failed to close placeholder card #$target_number"
-    else
-        log_warn "Cannot close placeholder card #$target_number - missing required config:"
-        [[ -z "$FIZZY_BASE_URL" ]] && log_warn "  - FIZZY_BASE_URL is empty"
-        [[ -z "$FIZZY_ACCOUNT_ID" ]] && log_warn "  - FIZZY_ACCOUNT_ID is empty (use --account)"
-        [[ -z "$default_token" ]] && log_warn "  - default_token is empty"
+    # Extract actual card number from Location header for closure
+    local location_header actual_number
+    location_header=$(echo "$response" | tail -1)
+    actual_number=$(echo "$location_header" | sed -E 's|.*/cards/([0-9]+)\.json$|\1|')
+    if [[ -z "$actual_number" || ! "$actual_number" =~ ^[0-9]+$ ]]; then
+        actual_number="$target_number"
+        log_verbose "Could not parse card number from Location header, using target: $target_number"
     fi
 
-    log_verbose "Created and closed placeholder card #$target_number in Dump board"
+    # Close the placeholder card immediately
+    local closure_timestamp
+    closure_timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    local closure_payload
+    closure_payload=$(jq -n --arg ts "$closure_timestamp" '{"closure": {"closed_at": $ts}}')
+    fizzy_api_post "/${FIZZY_ACCOUNT_ID}/cards/${actual_number}/closure" "$closure_payload" "$default_token" >/dev/null 2>&1 || \
+        log_warn "Failed to close placeholder card #$actual_number"
+
+    log_verbose "Created and closed placeholder card #$actual_number in Dump board (target: #$target_number)"
 }
 
 # Fill gaps in card numbers by creating placeholder cards
@@ -1334,29 +1439,26 @@ main() {
 
         # Fetch existing card numbers from Fizzy to skip already-migrated issues
         log_info "Fetching existing cards from Fizzy..."
-        local fizzy_opts=""
-        [[ -n "$FIZZY_ACCOUNT_ID" ]] && fizzy_opts+=" --account $FIZZY_ACCOUNT_ID"
         local default_token
         default_token=$(get_fizzy_token_for_user "" true)
-        [[ -n "$default_token" ]] && fizzy_opts+=" --token \"$default_token\""
 
         # Find all card numbers across ALL boards (card numbers are account-wide)
         # Need to fetch both open and closed cards separately
         log_info "Finding all card numbers in account..."
         local all_boards
-        all_boards=$(fizzy board list $fizzy_opts 2>/dev/null) || true
+        all_boards=$(fizzy_api_get_all_pages "/${FIZZY_ACCOUNT_ID}/boards" "$default_token") || true
         local board_ids
-        board_ids=$(echo "$all_boards" | jq -r '.data[].id // empty' 2>/dev/null) || board_ids=""
+        board_ids=$(echo "$all_boards" | jq -r '.[].id // empty' 2>/dev/null) || board_ids=""
 
         local all_card_numbers="[]"
         for board_id in $board_ids; do
             # Fetch all open card numbers (paginated)
             local open_nums
-            open_nums=$(fetch_all_card_numbers_paginated --board "$board_id" --all --sort newest $fizzy_opts)
+            open_nums=$(fetch_all_card_numbers_paginated "/${FIZZY_ACCOUNT_ID}/cards?board_ids[]=${board_id}&sorted_by=newest" "$default_token")
 
             # Fetch all closed card numbers (paginated)
             local closed_nums
-            closed_nums=$(fetch_all_card_numbers_paginated --board "$board_id" --all --indexed-by closed --sort newest $fizzy_opts)
+            closed_nums=$(fetch_all_card_numbers_paginated "/${FIZZY_ACCOUNT_ID}/cards?board_ids[]=${board_id}&indexed_by=closed&sorted_by=newest" "$default_token")
 
             # Combine with all card numbers
             all_card_numbers=$(echo "$all_card_numbers" | jq --argjson open "$open_nums" --argjson closed "$closed_nums" '. + $open + $closed | unique') || {
