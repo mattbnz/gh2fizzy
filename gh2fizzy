@@ -32,6 +32,7 @@ QUIET=false
 CLOSE_ISSUES=false
 ADD_MIGRATED_LABEL=false
 PRESERVE_NUMBERS=false
+FIX_MODE=false
 ISSUES_FILE=""  # Cache file for GitHub issues JSON
 DUMP_BOARD_ID=""  # Board ID for placeholder cards (auto-created if needed)
 FIZZY_BASE_URL=""  # Base URL for Fizzy instance (extracted from identity)
@@ -132,6 +133,9 @@ BEHAVIOR:
     --add-migrated-label    Add "migrated-to-fizzy" label to issues
     --preserve-numbers      Create cards in issue number order and verify
                             Fizzy assigns matching card numbers (aborts on mismatch)
+    --fix                   Fix a partially-migrated card: detect missing tags,
+                            comments, timeline events, and closure status, then
+                            add only what's missing. Requires exactly one -i NUMBER.
     --issues-file FILE      Read/write GitHub issues JSON from FILE (skips API call
                             if file exists; saves response if fetched)
 
@@ -170,6 +174,10 @@ EXAMPLES:
 
     # Migrate and mark as migrated in GitHub
     gh2fizzy --board 12345 --identity-map map.json --default-account bot --close-issues --add-migrated-label
+
+    # Fix a partially-migrated card (preview first, then apply)
+    gh2fizzy --board 12345 --identity-map map.json --default-account bot --fix -i 42 --dry-run
+    gh2fizzy --board 12345 --identity-map map.json --default-account bot --fix -i 42
 EOF
 }
 
@@ -247,6 +255,10 @@ parse_args() {
                 ;;
             --preserve-numbers)
                 PRESERVE_NUMBERS=true
+                shift
+                ;;
+            --fix)
+                FIX_MODE=true
                 shift
                 ;;
             --issues-file)
@@ -512,8 +524,18 @@ validate_args() {
         fi
     fi
 
-    # Default to 'all' state when preserve-numbers is enabled (unless explicitly set)
-    if [[ "$PRESERVE_NUMBERS" == "true" && "$STATE_SET" == "false" ]]; then
+    # Validate --fix mode constraints
+    if [[ "$FIX_MODE" == "true" ]]; then
+        if [[ ${#ISSUES[@]} -ne 1 ]]; then
+            die "--fix requires exactly one -i NUMBER" 2
+        fi
+        if [[ "$PRESERVE_NUMBERS" == "true" ]]; then
+            die "--fix is incompatible with --preserve-numbers" 2
+        fi
+    fi
+
+    # Default to 'all' state when preserve-numbers or fix mode is enabled (unless explicitly set)
+    if [[ ("$PRESERVE_NUMBERS" == "true" || "$FIX_MODE" == "true") && "$STATE_SET" == "false" ]]; then
         STATE="all"
         log_verbose "Defaulting --state to 'all' for preserve-numbers mode"
     fi
@@ -1447,16 +1469,288 @@ post_migration_github() {
 print_summary() {
     echo ""
     echo "============================================"
-    echo "Migration Summary"
+    if [[ "$FIX_MODE" == "true" ]]; then
+        echo "Fix Summary"
+    else
+        echo "Migration Summary"
+    fi
     echo "============================================"
     echo "Total issues processed: $TOTAL_ISSUES"
-    echo "Successfully migrated:  $SUCCESS_COUNT"
+    if [[ "$FIX_MODE" == "true" ]]; then
+        echo "Successfully fixed:     $SUCCESS_COUNT"
+    else
+        echo "Successfully migrated:  $SUCCESS_COUNT"
+    fi
     echo "Failed:                 $FAIL_COUNT"
     echo "============================================"
 
     if [[ "$DRY_RUN" == "true" ]]; then
         echo ""
         echo "This was a DRY RUN - no changes were made."
+    fi
+}
+
+fix_fizzy_card() {
+    local title="$1"
+    local body="$2"
+    local labels_json="$3"
+    local comments_json="$4"
+    local issue_number="$5"
+    local created_at="$6"
+    # $7 (expected_number) unused in fix mode
+    local issue_state="${8:-open}"
+    local author="${9:-unknown}"
+    local closed_at="${10:-}"
+    local relationships_json="${11:-}"
+    local issue_type="${12:-}"
+
+    local card_number="$issue_number"
+
+    log_info "Fixing card #$card_number for issue #$issue_number"
+
+    local card_token
+    card_token=$(get_fizzy_token_for_user "$author" true)
+
+    local default_token
+    default_token=$(get_fizzy_token_for_user "" true)
+
+    # a. Fetch existing card from Fizzy
+    local card_response
+    card_response=$(fizzy_api_get "/${FIZZY_ACCOUNT_ID}/cards/${card_number}.json" "$default_token") || true
+
+    local card_exists
+    card_exists=$(echo "$card_response" | jq -e '.number' 2>/dev/null) || true
+    if [[ -z "$card_exists" || "$card_exists" == "null" ]]; then
+        log_error "Card #$card_number does not exist in Fizzy — cannot fix"
+        return 1
+    fi
+
+    local fixed_anything=false
+
+    # b. Fix tags — compare existing tags with expected, only add missing ones
+    # CRITICAL: tagging endpoint is a TOGGLE, so never call for already-present tags
+    local existing_tags
+    existing_tags=$(echo "$card_response" | jq '[.tags // [] | .[] | ascii_downcase]' 2>/dev/null) || existing_tags="[]"
+
+    # Build expected tags list from labels
+    local expected_tags="[]"
+    local label_count
+    label_count=$(echo "$labels_json" | jq 'length')
+    if [[ "$label_count" -gt 0 ]]; then
+        expected_tags=$(echo "$labels_json" | jq '[.[].name]')
+    fi
+
+    # Add issue type mapped tag if applicable
+    if [[ -n "$issue_type" ]]; then
+        local type_lower mapped_tag
+        type_lower=$(echo "$issue_type" | tr '[:upper:]' '[:lower:]')
+        mapped_tag="${ISSUE_TYPE_TAG_MAP[$type_lower]:-}"
+        if [[ -n "$mapped_tag" ]]; then
+            expected_tags=$(echo "$expected_tags" | jq --arg tag "$mapped_tag" '. + [$tag]')
+        fi
+    fi
+
+    # Find tags to add (expected but not present)
+    local tags_to_add
+    tags_to_add=$(jq -n --argjson expected "$expected_tags" --argjson existing "$existing_tags" \
+        '$expected | map(select(ascii_downcase as $t | $existing | index($t) | not))')
+
+    local tags_to_add_count
+    tags_to_add_count=$(echo "$tags_to_add" | jq 'length')
+    if [[ "$tags_to_add_count" -gt 0 ]]; then
+        local tag_names
+        tag_names=$(echo "$tags_to_add" | jq -r 'join(", ")')
+        if [[ "$DRY_RUN" == "true" ]]; then
+            log_info "[DRY-RUN] Would add $tags_to_add_count missing tag(s): $tag_names"
+        else
+            log_info "Adding $tags_to_add_count missing tag(s): $tag_names"
+            local t=0
+            while [[ $t -lt $tags_to_add_count ]]; do
+                local tag_name tag_payload
+                tag_name=$(echo "$tags_to_add" | jq -r ".[$t]")
+                tag_payload=$(jq -n --arg tag "$tag_name" '{"tag_title": $tag}')
+                fizzy_api_post "/${FIZZY_ACCOUNT_ID}/cards/${card_number}/taggings" "$tag_payload" "$card_token" >/dev/null 2>&1 || \
+                    log_warn "Failed to apply tag: $tag_name"
+                t=$((t + 1))
+            done
+        fi
+        fixed_anything=true
+    else
+        log_verbose "All expected tags already present"
+    fi
+
+    # c. Fix comments — fetch existing Fizzy comments, compare by created_at timestamp
+    local existing_comments
+    existing_comments=$(fizzy_api_get_all_pages "/${FIZZY_ACCOUNT_ID}/cards/${card_number}/comments" "$default_token") || existing_comments="[]"
+
+    # Extract existing comment timestamps for matching
+    # Normalize by stripping fractional seconds (Fizzy returns .000Z, GitHub omits them)
+    local existing_timestamps
+    existing_timestamps=$(echo "$existing_comments" | jq '[.[].created_at // empty | sub("\\.[0-9]+"; "")]' 2>/dev/null) || existing_timestamps="[]"
+
+    # Fix GitHub issue comments
+    local comment_count
+    comment_count=$(echo "$comments_json" | jq 'length')
+    if [[ "$comment_count" -gt 0 ]]; then
+        local repo_slug="$REPO"
+        if [[ -z "$repo_slug" ]]; then
+            repo_slug=$(gh repo view --json nameWithOwner -q '.nameWithOwner' 2>/dev/null) || repo_slug=""
+        fi
+
+        local comments_added=0
+        local comments_skipped=0
+        local k=0
+        while [[ $k -lt $comment_count ]]; do
+            local comment_created_at
+            comment_created_at=$(echo "$comments_json" | jq -r ".[$k].createdAt // \"\"")
+
+            # Check if a comment with this timestamp already exists (normalize fractional seconds)
+            local already_exists normalized_ts
+            normalized_ts=$(echo "$comment_created_at" | sed 's/\.[0-9]*//')
+            already_exists=$(echo "$existing_timestamps" | jq --arg ts "$normalized_ts" 'map(select(. == $ts)) | length > 0')
+
+            if [[ "$already_exists" == "true" ]]; then
+                comments_skipped=$((comments_skipped + 1))
+            else
+                local c_author c_body
+                c_author=$(echo "$comments_json" | jq -r ".[$k].author.login // \"unknown\"")
+                c_body=$(echo "$comments_json" | jq -r ".[$k].body // \"\"")
+
+                if [[ "$DRY_RUN" == "true" ]]; then
+                    log_info "[DRY-RUN] Would add missing comment from @$c_author ($comment_created_at)"
+                else
+                    if create_fizzy_comment "$card_number" "$c_author" "$c_body" "$comment_created_at" "" "false" "$repo_slug"; then
+                        comments_added=$((comments_added + 1))
+                    else
+                        log_warn "Failed to add comment from @$c_author ($comment_created_at)"
+                    fi
+                fi
+                fixed_anything=true
+            fi
+            k=$((k + 1))
+        done
+        if [[ $comments_skipped -gt 0 ]]; then
+            log_verbose "Skipped $comments_skipped comment(s) already present"
+        fi
+        if [[ $comments_added -gt 0 ]]; then
+            log_info "Added $comments_added missing comment(s)"
+        fi
+    fi
+
+    # Fix timeline events
+    local repo_slug="$REPO"
+    if [[ -z "$repo_slug" ]]; then
+        repo_slug=$(gh repo view --json nameWithOwner -q '.nameWithOwner' 2>/dev/null) || repo_slug=""
+    fi
+
+    if [[ -n "$repo_slug" ]]; then
+        log_verbose "Fetching timeline events for issue #$issue_number..."
+        local timeline_events
+        timeline_events=$(fetch_timeline_events "$repo_slug" "$issue_number")
+
+        local timeline_count
+        timeline_count=$(echo "$timeline_events" | jq 'length')
+
+        if [[ "$timeline_count" -gt 0 ]]; then
+            local timeline_added=0
+            local timeline_skipped=0
+            local t=0
+            while [[ $t -lt $timeline_count ]]; do
+                local event actor event_time commit_id source_type source_number source_title source_repo
+                event=$(echo "$timeline_events" | jq -r ".[$t].event")
+                actor=$(echo "$timeline_events" | jq -r ".[$t].actor // \"unknown\"")
+                event_time=$(echo "$timeline_events" | jq -r ".[$t].created_at // \"\"")
+                commit_id=$(echo "$timeline_events" | jq -r ".[$t].commit_id // \"\"")
+                source_type=$(echo "$timeline_events" | jq -r ".[$t].source_type // \"\"")
+                source_number=$(echo "$timeline_events" | jq -r ".[$t].source_number // \"\"")
+                source_title=$(echo "$timeline_events" | jq -r ".[$t].source_title // \"\"")
+                source_repo=$(echo "$timeline_events" | jq -r ".[$t].source_repo // \"\"")
+
+                # Skip "closed" events when issue is closed
+                if [[ "$event" == "closed" && ("$issue_state" == "closed" || "$issue_state" == "CLOSED") ]]; then
+                    t=$((t + 1))
+                    continue
+                fi
+
+                # Check if timeline event already exists by timestamp (normalize fractional seconds)
+                local already_exists normalized_event_time
+                normalized_event_time=$(echo "$event_time" | sed 's/\.[0-9]*//')
+                already_exists=$(echo "$existing_timestamps" | jq --arg ts "$normalized_event_time" 'map(select(. == $ts)) | length > 0')
+
+                if [[ "$already_exists" == "true" ]]; then
+                    timeline_skipped=$((timeline_skipped + 1))
+                else
+                    local event_body
+                    event_body=$(format_timeline_comment "$event" "$actor" "$event_time" "$commit_id" "$repo_slug" "$source_type" "$source_number" "$source_title" "$BOARD_ID" "$source_repo")
+
+                    if [[ -n "$event_body" ]]; then
+                        if [[ "$DRY_RUN" == "true" ]]; then
+                            log_info "[DRY-RUN] Would add missing timeline event: $event ($event_time)"
+                        else
+                            if create_fizzy_comment "$card_number" "" "$event_body" "$event_time" "" "true" "$repo_slug"; then
+                                timeline_added=$((timeline_added + 1))
+                            else
+                                log_warn "Failed to add timeline event: $event ($event_time)"
+                            fi
+                        fi
+                        fixed_anything=true
+                    fi
+                fi
+                t=$((t + 1))
+            done
+            if [[ $timeline_skipped -gt 0 ]]; then
+                log_verbose "Skipped $timeline_skipped timeline event(s) already present"
+            fi
+            if [[ $timeline_added -gt 0 ]]; then
+                log_info "Added $timeline_added missing timeline event(s)"
+            fi
+        fi
+    fi
+
+    # d. Fix closure — close card if GitHub issue is closed but Fizzy card is open
+    local card_closed
+    card_closed=$(echo "$card_response" | jq -r '.closed // false' 2>/dev/null)
+
+    if [[ ("$issue_state" == "closed" || "$issue_state" == "CLOSED") && "$card_closed" != "true" ]]; then
+        if [[ "$DRY_RUN" == "true" ]]; then
+            log_info "[DRY-RUN] Would close card #$card_number (GitHub issue is closed)"
+        else
+            log_info "Closing card #$card_number (GitHub issue is closed)"
+            local closure_timestamp="${closed_at:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}"
+            local closure_payload
+            closure_payload=$(jq -n --arg ts "$closure_timestamp" '{"closure": {"closed_at": $ts}}')
+            fizzy_api_post "/${FIZZY_ACCOUNT_ID}/cards/${card_number}/closure" "$closure_payload" "$card_token" >/dev/null 2>&1 || \
+                log_warn "Failed to close card #$card_number"
+        fi
+        fixed_anything=true
+    else
+        if [[ "$card_closed" == "true" ]]; then
+            log_verbose "Card already closed"
+        fi
+    fi
+
+    # e. Fix column — move to column if specified (idempotent, safe to always call)
+    if [[ -n "$COLUMN_ID" ]]; then
+        if [[ "$DRY_RUN" == "true" ]]; then
+            log_info "[DRY-RUN] Would move card #$card_number to column $COLUMN_ID"
+        else
+            log_verbose "Moving card #$card_number to column $COLUMN_ID"
+            local triage_payload
+            triage_payload=$(jq -n --arg col "$COLUMN_ID" '{"column_id": $col}')
+            fizzy_api_post "/${FIZZY_ACCOUNT_ID}/cards/${card_number}/triage" "$triage_payload" "$card_token" >/dev/null 2>&1 || \
+                log_warn "Failed to move card to column"
+        fi
+        fixed_anything=true
+    fi
+
+    if [[ "$fixed_anything" == "false" ]]; then
+        log_success "Card #$card_number is already fully migrated — nothing to fix"
+    else
+        if [[ "$DRY_RUN" == "true" ]]; then
+            log_success "[DRY-RUN] Would fix card #$card_number"
+        else
+            log_success "Fixed card #$card_number"
+        fi
     fi
 }
 
@@ -1648,7 +1942,11 @@ main() {
         exit 0
     fi
 
-    log_info "Will migrate $TOTAL_ISSUES issue(s)"
+    if [[ "$FIX_MODE" == "true" ]]; then
+        log_info "FIX MODE — will repair partially-migrated card(s)"
+    else
+        log_info "Will migrate $TOTAL_ISSUES issue(s)"
+    fi
 
     # Process each issue
     local i=0
@@ -1679,6 +1977,21 @@ main() {
         issue_type=$(fetch_issue_type "$REPO" "$number")
         if [[ -n "$issue_type" ]]; then
             log_verbose "Issue #$number type: $issue_type"
+        fi
+
+        if [[ "$FIX_MODE" == "true" ]]; then
+            # Fix mode: repair existing card, skip post-migration GitHub actions
+            local result=0
+            fix_fizzy_card "$title" "$body" "$labels_json" "$comments_json" "$number" "$created_at" "" "$issue_state" "$author" "$closed_at" "$relationships_json" "$issue_type" || result=$?
+
+            if [[ $result -eq 0 ]]; then
+                SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
+            else
+                FAIL_COUNT=$((FAIL_COUNT + 1))
+            fi
+
+            i=$((i + 1))
+            continue
         fi
 
         # Pass expected number if preserve-numbers mode is enabled
