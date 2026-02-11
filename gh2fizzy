@@ -41,6 +41,13 @@ DEFAULT_ACCOUNT=""  # GitHub username from map to use as default for system comm
 # Associative array for identity mapping (loaded from file)
 declare -A IDENTITY_MAP
 
+# Mapping from GitHub issue type (lowercase) to Fizzy tag
+declare -A ISSUE_TYPE_TAG_MAP=(
+    ["feature"]="enhancement"
+    ["bug"]="customer-visible"
+    ["task"]="internal-only"
+)
+
 # Counters for summary
 TOTAL_ISSUES=0
 SUCCESS_COUNT=0
@@ -838,6 +845,37 @@ fetch_issue_relationships() {
     echo "{\"parent\": ${parent_json}, \"children\": ${children}}"
 }
 
+# Fetch the issue type name for a GitHub issue via GraphQL
+fetch_issue_type() {
+    local repo_slug="$1"
+    local issue_number="$2"
+
+    if [[ -z "$repo_slug" ]]; then
+        repo_slug=$(gh repo view --json nameWithOwner -q '.nameWithOwner' 2>/dev/null) || repo_slug=""
+    fi
+
+    if [[ -z "$repo_slug" ]]; then
+        return
+    fi
+
+    local owner repo
+    owner="${repo_slug%%/*}"
+    repo="${repo_slug##*/}"
+
+    local result
+    result=$(gh api graphql -f query='
+        query($owner: String!, $repo: String!, $number: Int!) {
+            repository(owner: $owner, name: $repo) {
+                issue(number: $number) {
+                    issueType { name }
+                }
+            }
+        }' -F owner="$owner" -F repo="$repo" -F number="$issue_number" \
+        --jq '.data.repository.issue.issueType.name // empty' 2>/dev/null) || true
+
+    echo "$result"
+}
+
 format_timeline_comment() {
     local event="$1"
     local actor="$2"
@@ -991,6 +1029,7 @@ create_fizzy_card() {
     local author="${9:-unknown}"  # GitHub issue author
     local closed_at="${10:-}"  # GitHub issue closed_at timestamp
     local relationships_json="${11:-}"  # Parent/child issue relationships JSON
+    local issue_type="${12:-}"  # GitHub issue type (e.g. Bug, Feature, Task)
 
     log_verbose "Creating card for issue #$issue_number: $title"
 
@@ -1009,6 +1048,18 @@ create_fizzy_card() {
             local label_names
             label_names=$(echo "$labels_json" | jq -r '.[].name' | tr '\n' ', ' | sed 's/,$//')
             log_verbose "[DRY-RUN] Would apply tags: $label_names"
+        fi
+
+        # Show issue type tag that would be applied
+        if [[ -n "$issue_type" ]]; then
+            local type_lower mapped_tag
+            type_lower=$(echo "$issue_type" | tr '[:upper:]' '[:lower:]')
+            mapped_tag="${ISSUE_TYPE_TAG_MAP[$type_lower]:-}"
+            if [[ -n "$mapped_tag" ]]; then
+                log_verbose "[DRY-RUN] Would apply issue type tag: $mapped_tag (from type: $issue_type)"
+            else
+                log_verbose "[DRY-RUN] No tag mapping for issue type: $issue_type"
+            fi
         fi
 
         # Show comment count
@@ -1148,6 +1199,22 @@ create_fizzy_card() {
                 log_warn "Failed to apply tag: $label_name"
             j=$((j + 1))
         done
+    fi
+
+    # Apply tag from issue type mapping
+    if [[ -n "$issue_type" ]]; then
+        local type_lower mapped_tag
+        type_lower=$(echo "$issue_type" | tr '[:upper:]' '[:lower:]')
+        mapped_tag="${ISSUE_TYPE_TAG_MAP[$type_lower]:-}"
+        if [[ -n "$mapped_tag" ]]; then
+            log_verbose "Applying issue type tag: $mapped_tag (from type: $issue_type)"
+            local type_tag_payload
+            type_tag_payload=$(jq -n --arg tag "$mapped_tag" '{"tag_title": $tag}')
+            fizzy_api_post "/${FIZZY_ACCOUNT_ID}/cards/${card_number}/taggings" "$type_tag_payload" "$card_token" >/dev/null 2>&1 || \
+                log_warn "Failed to apply issue type tag: $mapped_tag"
+        else
+            log_verbose "No tag mapping for issue type: $issue_type"
+        fi
     fi
 
     # Add migrated comments as individual comments
@@ -1607,6 +1674,13 @@ main() {
         relationships_json=$(fetch_issue_relationships "$REPO" "$number")
         log_verbose "Issue #$number relationships: $relationships_json"
 
+        # Fetch issue type via GraphQL
+        local issue_type
+        issue_type=$(fetch_issue_type "$REPO" "$number")
+        if [[ -n "$issue_type" ]]; then
+            log_verbose "Issue #$number type: $issue_type"
+        fi
+
         # Pass expected number if preserve-numbers mode is enabled
         local expected_number=""
         if [[ "$PRESERVE_NUMBERS" == "true" ]]; then
@@ -1635,7 +1709,7 @@ main() {
 
         local result=0
         MISMATCH_ACTUAL_NUMBER=""
-        create_fizzy_card "$title" "$body" "$labels_json" "$comments_json" "$number" "$created_at" "$expected_number" "$issue_state" "$author" "$closed_at" "$relationships_json" || result=$?
+        create_fizzy_card "$title" "$body" "$labels_json" "$comments_json" "$number" "$created_at" "$expected_number" "$issue_state" "$author" "$closed_at" "$relationships_json" "$issue_type" || result=$?
 
         if [[ $result -eq 0 ]]; then
             SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
